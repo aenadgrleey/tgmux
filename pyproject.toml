@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tgmux"
+version = "0.1.0"
+description = "Share one Telegram user account between several services, with per-chat ownership"
+requires-python = ">=3.11"
+# Telethon internals (_sender, _call, _dispatch_update) are used on purpose.
+# Bump only together with the tests in tests/test_end_to_end.py.
+dependencies = ["telethon==1.46.0"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+tgmux = "tgmux.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]

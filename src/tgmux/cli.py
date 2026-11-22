@@ -1,0 +1,300 @@
+"""tgmux command line: run the gateway and manage integrations / chat ownership."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import fcntl
+import logging
+import signal
+import sys
+from pathlib import Path
+
+from tgmux import config as config_mod
+from tgmux.registry import Registry, UnknownIntegrationError
+
+log = logging.getLogger("tgmux")
+
+
+def _registry(cfg: config_mod.Config) -> Registry:
+    return Registry(cfg.db)
+
+
+# --- serve -------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _single_instance(lock_file: Path):
+    lock_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    handle = lock_file.open("w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(f"another tgmux gateway is already running (lock {lock_file})")
+    try:
+        yield
+    finally:
+        handle.close()
+
+
+async def _serve(cfg: config_mod.Config) -> int:
+    from telethon import TelegramClient
+
+    from tgmux.gateway import Gateway
+    from tgmux.reporter import BotReporter, LogReporter
+    from tgmux.upstream import TelethonUpstream
+
+    if cfg.session is None or not cfg.session.exists():
+        raise SystemExit(f"Telegram session not found ({cfg.session}); run `tgmux telegram set --session ... --credentials ...`")
+    api_id, api_hash = config_mod.api_credentials(cfg)
+
+    registry = _registry(cfg)
+    reporter = LogReporter()
+    if cfg.reporter is not None:
+        reporter = BotReporter(cfg.reporter.token(), cfg.reporter.chat_id)
+        reporter.start()
+
+    upstream = TelethonUpstream(TelegramClient(str(cfg.session), api_id, api_hash))
+    await upstream.start()
+    gateway = Gateway(upstream, registry, reporter)
+    server = await gateway.serve(cfg.socket)
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop.set)
+
+    stop_wait = loop.create_task(stop.wait())
+    upstream_lost = loop.create_task(upstream.client.disconnected)
+    reporter.report("lifecycle", "шлюз запущен", window=0)
+    await asyncio.wait({stop_wait, upstream_lost}, return_when=asyncio.FIRST_COMPLETED)
+    exit_code = 0
+    if upstream_lost.done() and not stop.is_set():
+        reporter.report("upstream-lost", "соединение с Telegram потеряно, шлюз завершается", window=0)
+        exit_code = 1
+    stop_wait.cancel()
+    upstream_lost.cancel()
+
+    server.close()
+    await server.wait_closed()
+    await upstream.stop()
+    if isinstance(reporter, BotReporter):
+        await asyncio.sleep(1)  # let the last report go out
+        await reporter.stop()
+    return exit_code
+
+
+def cmd_serve(args) -> int:
+    cfg = _load(args)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("telethon").setLevel(logging.WARNING)
+    with _single_instance(cfg.lock_file):
+        return asyncio.run(_serve(cfg))
+
+
+# --- integrations ------------------------------------------------------------
+
+def cmd_integration_add(args) -> int:
+    cfg = _load(args)
+    try:
+        _registry(cfg).add_integration(args.name)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+    print(f"integration {args.name} created")
+    return 0
+
+
+def cmd_integration_remove(args) -> int:
+    cfg = _load(args)
+    if not _registry(cfg).remove_integration(args.name):
+        raise SystemExit(f"unknown integration {args.name}")
+    print(f"integration {args.name} removed; its chats are free")
+    return 0
+
+
+def cmd_integration_list(args) -> int:
+    cfg = _load(args)
+    registry = _registry(cfg)
+    for name in registry.integrations():
+        print(f"{name}\t{len(registry.owned_by(name))} chats")
+    return 0
+
+
+# --- chats -------------------------------------------------------------------
+
+def cmd_chats(args) -> int:
+    cfg = _load(args)
+    for binding in _registry(cfg).bindings():
+        if args.integration and binding.integration != args.integration:
+            continue
+        print(f"{binding.chat_id}\t{binding.integration}\t{binding.source}")
+    return 0
+
+
+def cmd_grant(args) -> int:
+    cfg = _load(args)
+    try:
+        previous = _registry(cfg).assign(args.chat_id, args.integration)
+    except UnknownIntegrationError:
+        raise SystemExit(f"unknown integration {args.integration}")
+    suffix = f" (was {previous})" if previous and previous != args.integration else ""
+    print(f"chat {args.chat_id} -> {args.integration}{suffix}")
+    return 0
+
+
+def cmd_release(args) -> int:
+    cfg = _load(args)
+    if not _registry(cfg).release(args.chat_id):
+        raise SystemExit(f"chat {args.chat_id} has no owner")
+    print(f"chat {args.chat_id} released")
+    return 0
+
+
+# --- telegram / reporter settings (non-interactive) -------------------------
+
+def cmd_telegram_set(args) -> int:
+    for path in (args.session, args.credentials):
+        if not path.expanduser().exists():
+            raise SystemExit(f"not found: {path}")
+    path = config_mod.config_path(args.config)
+    config_mod.update(path, "telegram", {
+        "session": str(args.session.expanduser().resolve()),
+        "credentials": str(args.credentials.expanduser().resolve()),
+    })
+    print(f"[telegram] written to {path}")
+    return 0
+
+
+def _read_token(args) -> tuple[str, Path | None]:
+    """Return (token, file to save it to or None if it already lives in a file)."""
+    if args.token_file is not None:
+        token = args.token_file.expanduser().read_text().strip()
+        return token, None
+    token = sys.stdin.read().strip()
+    return token, config_mod.config_path(args.config).parent / "reporter.token"
+
+
+def cmd_reporter_set(args) -> int:
+    from tgmux.reporter import BotApiError, send_bot_message
+
+    try:
+        token, save_to = _read_token(args)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"token file not found: {exc.filename}")
+    if not token:
+        raise SystemExit("empty bot token")
+    if not args.no_verify:
+        # Nothing is written unless the bot can actually reach the recipient.
+        try:
+            send_bot_message(token, args.chat_id, "tgmux: отчёты будут приходить сюда")
+        except BotApiError as exc:
+            raise SystemExit(f"the bot cannot write to {args.chat_id}: {exc} (press /start in the bot first)")
+        except OSError as exc:
+            raise SystemExit(f"cannot reach the Bot API: {exc} (use --no-verify to skip)")
+    if save_to is not None:
+        config_mod.write_private(save_to, token + "\n")
+        token_file = save_to
+    else:
+        token_file = args.token_file.expanduser().resolve()
+    path = config_mod.config_path(args.config)
+    config_mod.update(path, "reporter", {"token_file": str(token_file), "chat_id": args.chat_id})
+    print(f"reports go to {args.chat_id}; [reporter] written to {path}")
+    return 0
+
+
+def cmd_reporter_disable(args) -> int:
+    path = config_mod.config_path(args.config)
+    config_mod.update(path, "reporter", None)
+    print(f"[reporter] removed from {path}; reports go to the log only")
+    return 0
+
+
+def cmd_reporter_show(args) -> int:
+    cfg = _load(args)
+    if cfg.reporter is None:
+        print("not configured")
+    else:
+        print(f"chat_id\t{cfg.reporter.chat_id}\ntoken_file\t{cfg.reporter.token_file}")
+    return 0
+
+
+def cmd_reporter_test(args) -> int:
+    from tgmux.reporter import BotApiError, send_bot_message
+
+    cfg = _load(args)
+    if cfg.reporter is None:
+        raise SystemExit("reporter is not configured; run `tgmux reporter set`")
+    try:
+        send_bot_message(cfg.reporter.token(), cfg.reporter.chat_id, "tgmux: тестовый отчёт")
+    except BotApiError as exc:
+        raise SystemExit(f"Bot API error: {exc}")
+    print("sent")
+    return 0
+
+
+# --- entry point -------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="tgmux", description=__doc__)
+    parser.add_argument("--config", help="path to config.toml")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("serve", help="run the gateway").set_defaults(func=cmd_serve)
+
+    integration = sub.add_parser("integration", help="manage integrations").add_subparsers(dest="action", required=True)
+    for action, func, helptext in (
+        ("add", cmd_integration_add, "register an integration name"),
+        ("remove", cmd_integration_remove, "delete an integration and free its chats"),
+    ):
+        p = integration.add_parser(action, help=helptext)
+        p.add_argument("name")
+        p.set_defaults(func=func)
+    integration.add_parser("list", help="list integrations").set_defaults(func=cmd_integration_list)
+
+    chats = sub.add_parser("chats", help="list chat ownership")
+    chats.add_argument("integration", nargs="?")
+    chats.set_defaults(func=cmd_chats)
+
+    grant = sub.add_parser("grant", help="give a chat to an integration")
+    grant.add_argument("chat_id", type=int, help="marked chat id (-100... for channels)")
+    grant.add_argument("integration")
+    grant.set_defaults(func=cmd_grant)
+
+    release = sub.add_parser("release", help="remove a chat's owner")
+    release.add_argument("chat_id", type=int)
+    release.set_defaults(func=cmd_release)
+
+    reporter = sub.add_parser("reporter", help="service bot for reports").add_subparsers(dest="action", required=True)
+    rset = reporter.add_parser("set", help="configure the service bot and its only recipient")
+    rset.add_argument("--chat-id", type=int, required=True, help="the one peer reports go to (must have pressed /start)")
+    token = rset.add_mutually_exclusive_group(required=True)
+    token.add_argument("--token-file", type=Path, help="existing file with the BotFather token")
+    token.add_argument("--token-stdin", action="store_true",
+                       help="read the token from stdin and store it 0600 next to the config")
+    rset.add_argument("--no-verify", action="store_true", help="do not send a test message before saving")
+    rset.set_defaults(func=cmd_reporter_set)
+    reporter.add_parser("disable", help="remove the service bot settings").set_defaults(func=cmd_reporter_disable)
+    reporter.add_parser("show", help="print the reporter settings").set_defaults(func=cmd_reporter_show)
+    reporter.add_parser("test", help="send a test report").set_defaults(func=cmd_reporter_test)
+
+    telegram = sub.add_parser("telegram", help="Telegram session settings").add_subparsers(dest="action", required=True)
+    tset = telegram.add_parser("set", help="point the gateway at an authorized Telethon session")
+    tset.add_argument("--session", type=Path, required=True, help="authorized .session file")
+    tset.add_argument("--credentials", type=Path, required=True, help="env file with API_ID and API_HASH")
+    tset.set_defaults(func=cmd_telegram_set)
+    return parser
+
+
+def _load(args) -> config_mod.Config:
+    return config_mod.load(args.config)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except config_mod.ConfigError as exc:
+        raise SystemExit(f"config error: {exc}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
