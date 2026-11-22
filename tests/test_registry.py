@@ -43,3 +43,18 @@ def test_removing_integration_frees_chats(tmp_path):
     registry.claim(1, "a", "dm")
     registry.remove_integration("a")
     assert registry.owner(1) is None
+
+
+def test_pending_joins_are_unique_per_chat_and_link():
+    registry = Registry()
+    registry.add_integration("a")
+    registry.add_integration("b")
+    first = registry.add_pending("a", chat_id=None, invite_hash="h", title="T")
+    assert registry.add_pending("b", chat_id=None, invite_hash="h", title="T").integration == "a"
+    registry.add_pending("b", chat_id=-1007, invite_hash=None, title="X")
+    registry.add_pending("b", chat_id=None, invite_hash="other", title="Y")  # several NULL chat_ids are fine
+    assert len(registry.pendings()) == 3
+    assert [p.id for p in registry.pending_matches(-1009, "t")] == [first.id]
+    assert registry.pending_matches(-1009, None) == []
+    registry.remove_integration("a")
+    assert [p.integration for p in registry.pendings()] == ["b", "b"]

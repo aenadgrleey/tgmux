@@ -9,7 +9,8 @@ import logging
 import os
 import time
 import traceback
-from collections import defaultdict
+from collections import defaultdict, deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,22 @@ log = logging.getLogger(__name__)
 CALL_CONNECTION_TTL = 60          # seconds an UpdateGroupCallConnection is attributed to the last joiner
 UNOWNED_REPORT_WINDOW = 24 * 3600
 OUTBOX_LIMIT = 10_000
+BACKLOG_LIMIT = 10_000            # updates kept per offline integration (oldest dropped first)
+BACKLOG_TTL = 24 * 3600           # seconds; older queued updates are dropped
+OFFLINE_GRACE = 30                # an integration absent this long is reported as unavailable
+STILL_OFFLINE_REMINDER = 3600     # repeat the "still unavailable" report this often
+SWEEP_INTERVAL = 10
+PENDING_TTL = 30 * 86400          # join requests not approved within this are forgotten
+
+
+@dataclass
+class _Outage:
+    """One period during which an integration is not connected."""
+    since: float
+    reported: bool = False
+    reminded_at: float = 0.0
+    overflowed: int = 0
+    expired: int = 0
 
 
 class _Connection:
@@ -87,6 +104,12 @@ class Gateway:
         reporter: Reporter | None = None,
         *,
         global_allow: frozenset[type] = GLOBAL_ALLOW,
+        backlog_limit: int = BACKLOG_LIMIT,
+        backlog_ttl: float = BACKLOG_TTL,
+        offline_grace: float = OFFLINE_GRACE,
+        pending_ttl: float = PENDING_TTL,
+        clock=time.monotonic,
+        wall_clock=time.time,
     ) -> None:
         self.upstream = upstream
         self.registry = registry
@@ -96,6 +119,16 @@ class Gateway:
         self._connections: dict[str, _Connection] = {}
         self._chat_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._last_call_join: tuple[str, float] | None = None
+        # In-memory only: integration restarts are covered here, gateway restarts by catch_up.
+        self._backlog: dict[str, deque[tuple[float, bytes]]] = {}
+        self._backlog_limit = backlog_limit
+        self._backlog_ttl = backlog_ttl
+        self._clock = clock
+        self._offline_grace = offline_grace
+        self._pending_ttl = pending_ttl
+        self._wall_clock = wall_clock
+        self._outages: dict[str, _Outage] = {}
+        self._sweeper: asyncio.Task | None = None
         upstream.set_update_handler(self.on_update)
 
     # --- server -----------------------------------------------------------
@@ -111,7 +144,19 @@ class Gateway:
         finally:
             os.umask(old_umask)
         log.info("tgmux gateway listening on %s", path)
+        for name in self.registry.integrations():  # nobody is connected yet
+            if name not in self._connections:
+                self._mark_offline(name)
+        self._sweeper = asyncio.get_running_loop().create_task(self._sweep_loop())
         return server
+
+    async def close(self) -> None:
+        if self._sweeper is not None:
+            self._sweeper.cancel()
+            try:
+                await self._sweeper
+            except asyncio.CancelledError:
+                pass
 
     def connected(self) -> list[str]:
         return sorted(self._connections)
@@ -128,15 +173,19 @@ class Gateway:
                 return
             name, wants_updates = hello
             conn = _Connection(name, writer, wants_updates)
-            previous = self._connections.get(name)
-            self._connections[name] = conn
-            if previous is not None:
-                log.info("integration %s reconnected; closing the previous connection", name)
-                await previous.close()
+            # WELCOME, registration and backlog flush happen with no await in between,
+            # so nothing can overtake WELCOME and queued updates keep their order.
             conn.send(Frame.WELCOME, json.dumps(
                 {"self_id": self.upstream.self_id, "version": protocol.PROTOCOL_VERSION}
             ).encode())
+            previous = self._connections.get(name)
+            self._connections[name] = conn
+            delivered, expired = self._flush_backlog(conn)
+            self._mark_online(name, delivered, expired)
             log.info("integration %s connected", name)
+            if previous is not None:
+                log.info("integration %s reconnected; closing the previous connection", name)
+                await previous.close()
             while True:
                 kind, payload = await protocol.read_frame(reader)
                 if kind is not Frame.CALL:
@@ -156,6 +205,7 @@ class Gateway:
                     self.reporter.report(f"overflow:{conn.name}", f"{conn.name} не успевал читать апдейты, соединение закрыто")
                 if self._connections.get(conn.name) is conn:
                     del self._connections[conn.name]
+                    self._mark_offline(conn.name)
                     log.info("integration %s disconnected", conn.name)
                 await conn.close()
             else:
@@ -262,11 +312,15 @@ class Gateway:
     async def _join_channel(self, integration: str, request) -> Any:
         chat = _input_channel_id(request, request.channel)
         async with self._chat_locks[chat]:
-            self._ensure_claimable(integration, chat, request)
+            self._ensure_claimable(integration, request, chat=chat)
             try:
                 result = await self.upstream.invoke(request)
             except tl_errors.UserAlreadyParticipantError:
                 self._claim(integration, chat, "join", request)
+                raise
+            except tl_errors.InviteRequestSentError:
+                title = await self._channel_title(request.channel)
+                self._record_pending(integration, request, chat_id=chat, invite_hash=None, title=title)
                 raise
             self._claim(integration, chat, "join", request)
             return result
@@ -277,11 +331,17 @@ class Gateway:
             # The account is already in this chat; whoever "joins" it first takes it.
             chat = utils.get_peer_id(check.chat)
             async with self._chat_locks[chat]:
-                self._ensure_claimable(integration, chat, request)
+                self._ensure_claimable(integration, request, chat=chat, invite_hash=request.hash)
                 self._claim(integration, chat, "invite", request)
                 return await self.upstream.invoke(request)
 
-        result = await self.upstream.invoke(request)
+        self._ensure_claimable(integration, request, invite_hash=request.hash)
+        try:
+            result = await self.upstream.invoke(request)
+        except tl_errors.InviteRequestSentError:
+            self._record_pending(integration, request, chat_id=None, invite_hash=request.hash,
+                                 title=getattr(check, "title", "") or "")
+            raise
         joined = [c for c in getattr(result, "chats", []) if isinstance(c, (types.Channel, types.Chat))]
         if not joined:
             self.reporter.report(
@@ -294,10 +354,56 @@ class Gateway:
             self._claim(integration, chat, "invite", request)
         return result
 
-    def _ensure_claimable(self, integration: str, chat: int, request) -> None:
-        owner = self.registry.owner(chat)
-        if owner is not None and owner != integration:
-            raise ChatOwnedByOtherError(request, f"chat {chat}")
+    def _ensure_claimable(self, integration: str, request, *, chat: int | None = None,
+                          invite_hash: str | None = None) -> None:
+        if chat is not None:
+            owner = self.registry.owner(chat)
+            if owner is not None and owner != integration:
+                raise ChatOwnedByOtherError(request, f"chat {chat}")
+        pending = self.registry.pending_conflict(chat_id=chat, invite_hash=invite_hash)
+        if pending is not None and pending.integration != integration:
+            raise ChatOwnedByOtherError(request, "another integration has a pending join request")
+
+    # --- pending join requests -------------------------------------------
+    # JoinChannel and ImportChatInvite answered with INVITE_REQUEST_SENT go through
+    # the same path: record now, assign the chat when it first shows up.
+
+    def _record_pending(self, integration: str, request, *, chat_id: int | None,
+                        invite_hash: str | None, title: str) -> None:
+        pending = self.registry.add_pending(
+            integration, chat_id=chat_id, invite_hash=invite_hash, title=title, now=int(self._wall_clock())
+        )
+        if pending.integration != integration:
+            raise ChatOwnedByOtherError(request, "another integration has a pending join request")
+        log.info("%s: join request #%d pending (%s)", integration, pending.id, title or chat_id)
+
+    async def _channel_title(self, channel) -> str:
+        try:
+            result = await self.upstream.invoke(functions.channels.GetChannelsRequest([channel]))
+            return getattr(result.chats[0], "title", "") or ""
+        except Exception:
+            return ""
+
+    def _resolve_pending(self, chat: int, update: TLObject, entity: TLObject | None) -> str | None:
+        """Assign a chat with no owner to the join request it answers, if any."""
+        title = getattr(entity, "title", None)
+        matches = self.registry.pending_matches(chat, title if _is_join_signal(update, entity, self.upstream.self_id) else None)
+        if not matches:
+            return None
+        if len(matches) > 1:
+            who = ", ".join(f"{p.integration} (#{p.id})" for p in matches)
+            self.reporter.report(
+                f"pending-ambiguous:{chat}",
+                f"Чат «{title}» ({chat}) подходит к нескольким заявкам: {who}. Владелец не назначен: "
+                f"`tgmux grant {chat} <интеграция>` и `tgmux pending cancel <id>`",
+                window=UNOWNED_REPORT_WINDOW,
+            )
+            return None
+        pending = matches[0]
+        owner = self.registry.claim(chat, pending.integration, "request")
+        self.registry.remove_pending(pending.id)
+        log.info("join request #%d approved: %s owns %s (%s)", pending.id, owner, chat, title)
+        return owner
 
     def _claim(self, integration: str, chat: int, source: str, request) -> None:
         owner = self.registry.claim(chat, integration, source)
@@ -373,6 +479,8 @@ class Gateway:
 
         owner = self.registry.owner(chat)
         if owner is None:
+            owner = self._resolve_pending(chat, update, entities.get(chat))
+        if owner is None:
             if isinstance(update, (types.UpdateNewMessage, types.UpdateNewChannelMessage)):
                 self.reporter.report(
                     f"unowned:{chat}",
@@ -384,12 +492,126 @@ class Gateway:
 
     def _deliver(self, owner: str, update: TLObject, entities: dict[int, TLObject], chat: int | None) -> None:
         conn = self._connections.get(owner)
+        if conn is not None and not conn.wants_updates:
+            return
+        payload = self._encode_update(update, entities, chat)
         if conn is None:
-            if isinstance(update, (types.UpdateNewMessage, types.UpdateNewChannelMessage)):
-                self.reporter.report(f"offline:{owner}", f"{owner} не подключён, его сообщения теряются", window=3600)
+            self._enqueue_backlog(owner, payload)
+        else:
+            conn.send(Frame.UPDATE, payload)
+
+    def _enqueue_backlog(self, owner: str, payload: bytes) -> None:
+        outage = self._mark_offline(owner)
+        queue = self._backlog.setdefault(owner, deque())
+        if len(queue) >= self._backlog_limit:
+            queue.popleft()
+            outage.overflowed += 1
+            if outage.overflowed == 1:
+                self.reporter.report(
+                    f"backlog-overflow:{owner}",
+                    f"⚠️ {owner}: очередь переполнена ({self._backlog_limit} апдейтов), "
+                    f"самые старые выбрасываются. Итог потерь придёт при переподключении.",
+                    window=0,
+                )
+        queue.append((self._clock(), payload))
+
+    def _flush_backlog(self, conn: _Connection) -> tuple[int, int]:
+        """Send queued updates; returns (delivered, expired)."""
+        queue = self._backlog.pop(conn.name, None)
+        if not queue or not conn.wants_updates:
+            return 0, 0
+        cutoff = self._clock() - self._backlog_ttl
+        fresh = [payload for queued_at, payload in queue if queued_at >= cutoff]
+        for payload in fresh:
+            conn.send(Frame.UPDATE, payload)
+        log.info("delivered %d queued updates to %s", len(fresh), conn.name)
+        return len(fresh), len(queue) - len(fresh)
+
+    # --- availability -----------------------------------------------------
+
+    def _mark_offline(self, name: str) -> _Outage:
+        outage = self._outages.get(name)
+        if outage is None:
+            outage = self._outages[name] = _Outage(since=self._clock())
+        return outage
+
+    def _mark_online(self, name: str, delivered: int, expired_at_flush: int) -> None:
+        outage = self._outages.pop(name, None)
+        if outage is None:
             return
-        if not conn.wants_updates:
-            return
+        outage.expired += expired_at_flush
+        lost = outage.overflowed + outage.expired
+        if not outage.reported and not lost:
+            return  # short reconnect, nothing lost: not worth a message
+        text = f"✅ {name} снова подключена после {_duration(self._clock() - outage.since)}; доставлено из очереди: {delivered}"
+        if lost:
+            text += f"\nпотеряно: {lost} (переполнение: {outage.overflowed}, старше {_duration(self._backlog_ttl)}: {outage.expired})"
+        self.reporter.report(f"online:{name}", text, window=0)
+
+    def sweep(self) -> None:
+        """Report unavailable integrations and drop expired queued updates. Runs every few seconds."""
+        now = self._clock()
+        cutoff = now - self._backlog_ttl
+        for name, queue in self._backlog.items():
+            expired = 0
+            while queue and queue[0][0] < cutoff:
+                queue.popleft()
+                expired += 1
+            if expired:
+                outage = self._mark_offline(name)
+                first = outage.expired == 0
+                outage.expired += expired
+                if first:
+                    self.reporter.report(
+                        f"backlog-expired:{name}",
+                        f"⚠️ {name}: апдейты старше {_duration(self._backlog_ttl)} выбрасываются из очереди "
+                        f"(уже {expired}). Итог потерь придёт при переподключении.",
+                        window=0,
+                    )
+        for pending in self.registry.expire_pending(int(self._wall_clock() - self._pending_ttl)):
+            self.reporter.report(
+                f"pending-expired:{pending.id}",
+                f"Заявка #{pending.id} от {pending.integration} на «{pending.title or pending.chat_id}» "
+                f"не одобрена за {_duration(self._pending_ttl)}, удалена",
+                window=0,
+            )
+        for name, outage in list(self._outages.items()):
+            if not self.registry.has_integration(name):
+                del self._outages[name]
+                self._backlog.pop(name, None)
+                continue
+            offline_for = now - outage.since
+            if not outage.reported and offline_for >= self._offline_grace:
+                outage.reported = True
+                outage.reminded_at = now
+                self.reporter.report(
+                    f"offline:{name}",
+                    f"🔴 {name} недоступна уже {_duration(offline_for)}; апдейты копятся в очереди "
+                    f"(лимит {self._backlog_limit}, хранятся {_duration(self._backlog_ttl)})",
+                    window=0,
+                )
+            elif outage.reported and now - outage.reminded_at >= STILL_OFFLINE_REMINDER:
+                outage.reminded_at = now
+                self.reporter.report(
+                    f"offline:{name}",
+                    f"🔴 {name} всё ещё недоступна ({_duration(offline_for)}); в очереди {self.backlog_size(name)}, "
+                    f"потеряно {outage.overflowed + outage.expired}",
+                    window=0,
+                )
+
+    async def _sweep_loop(self) -> None:
+        while True:
+            await asyncio.sleep(SWEEP_INTERVAL)
+            try:
+                self.sweep()
+            except Exception as exc:
+                log.exception("availability sweep failed")
+                self.reporter.report("sweep-error", f"Сбой проверки доступности: {type(exc).__name__}: {exc}")
+
+    def backlog_size(self, integration: str) -> int:
+        return len(self._backlog.get(integration, ()))
+
+    def _encode_update(self, update: TLObject, entities: dict[int, TLObject], chat: int | None) -> bytes:
         wanted = referenced_ids(update)
         if chat is not None:
             wanted.add(chat)
@@ -399,7 +621,7 @@ class Gateway:
             updates=[update], users=users, chats=chats,
             date=datetime.datetime.now(datetime.timezone.utc), seq=0,
         )
-        conn.send(Frame.UPDATE, bytes(container))
+        return bytes(container)
 
 
 def _input_channel_id(request, channel) -> int:
@@ -407,6 +629,30 @@ def _input_channel_id(request, channel) -> int:
     if raw is None:
         raise RequestNotAllowedError(request, "empty channel")
     return channel_id(raw)
+
+
+def _is_join_signal(update: TLObject, entity: TLObject | None, self_id: int) -> bool:
+    """Evidence that the account has just become a member (title matching needs it)."""
+    if isinstance(update, types.UpdateChannel):
+        return isinstance(entity, types.Channel) and not entity.left
+    message = getattr(update, "message", None)
+    action = getattr(message, "action", None)
+    if isinstance(action, types.MessageActionChatJoinedByRequest):
+        return True
+    if isinstance(action, types.MessageActionChatAddUser):
+        return self_id in action.users
+    return False
+
+
+def _duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 120:
+        return f"{seconds} с"
+    if seconds < 2 * 3600:
+        return f"{seconds // 60} мин"
+    if seconds < 2 * 86400:
+        return f"{seconds // 3600} ч"
+    return f"{seconds // 86400} д"
 
 
 def _title(entity: TLObject | None) -> str:

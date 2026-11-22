@@ -112,6 +112,8 @@ def test_whole_cli_runs_without_a_tty(tmp_path):
         ["grant", "-1005", "barabot"],
         ["chats"],
         ["release", "-1005"],
+        ["pending"],
+        ["pending", "list"],
         ["telegram", "set", "--session", str(session), "--credentials", str(creds)],
         ["reporter", "set", "--chat-id", "7", "--token-file", str(token), "--no-verify"],
         ["reporter", "show"],
@@ -129,6 +131,9 @@ def test_unauthorized_session_fails_instead_of_prompting():
     class Client:
         disconnected_called = False
 
+        def add_event_handler(self, handler, event):
+            pass
+
         async def connect(self):
             pass
 
@@ -141,3 +146,39 @@ def test_unauthorized_session_fails_instead_of_prompting():
     with pytest.raises(RuntimeError, match="not authorized"):
         asyncio.run(TelethonUpstream(Client()).start())
     assert Client.disconnected_called
+
+
+def test_update_handler_is_installed_before_connect():
+    """catch_up replays missed updates inside connect(); the handler must already be there."""
+    order = []
+
+    class Client:
+        def add_event_handler(self, handler, event):
+            order.append("handler")
+
+        async def connect(self):
+            order.append("connect")
+
+        async def is_user_authorized(self):
+            return True
+
+        async def get_me(self):
+            return type("Me", (), {"id": 1})()
+
+    asyncio.run(TelethonUpstream(Client()).start())
+    assert order == ["handler", "connect"]
+
+
+def test_pending_list_and_cancel(tmp_path, capsys):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'state_dir = "{tmp_path / "state"}"\n')
+    run(cfg, "integration", "add", "barabot")
+    registry = config.load(cfg)
+    from tgmux.registry import Registry
+    pending = Registry(registry.db).add_pending("barabot", chat_id=None, invite_hash="abc", title="Flats")
+    capsys.readouterr()
+    run(cfg, "pending")
+    assert f"#{pending.id}\tbarabot\t-\tabc\tFlats" in capsys.readouterr().out
+    run(cfg, "pending", "cancel", str(pending.id))
+    with pytest.raises(SystemExit, match="no pending"):
+        run(cfg, "pending", "cancel", str(pending.id))

@@ -22,11 +22,40 @@ CREATE TABLE IF NOT EXISTS integrations (
 CREATE TABLE IF NOT EXISTS chat_bindings (
     chat_id     INTEGER PRIMARY KEY,
     integration TEXT NOT NULL REFERENCES integrations(name) ON DELETE CASCADE,
-    source      TEXT NOT NULL,           -- join | invite | dm | admin
+    source      TEXT NOT NULL,           -- join | invite | dm | request | admin
     created_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS chat_bindings_by_integration ON chat_bindings(integration);
+
+-- Join requests waiting for an admin's approval (JoinChannel or ImportChatInvite
+-- answered with INVITE_REQUEST_SENT). chat_id is known for JoinChannel and NULL
+-- for private invite links until the chat shows up.
+CREATE TABLE IF NOT EXISTS pending_joins (
+    id          INTEGER PRIMARY KEY,
+    integration TEXT NOT NULL REFERENCES integrations(name) ON DELETE CASCADE,
+    chat_id     INTEGER UNIQUE,
+    invite_hash TEXT UNIQUE,
+    title       TEXT NOT NULL,
+    created_at  INTEGER NOT NULL
+);
 """
+
+
+@dataclass(frozen=True)
+class PendingJoin:
+    id: int
+    integration: str
+    chat_id: int | None
+    invite_hash: str | None
+    title: str
+    created_at: int
+
+
+def normalize_title(title: str) -> str:
+    return " ".join(title.split()).casefold()
+
+
+_PENDING_COLUMNS = "id, integration, chat_id, invite_hash, title, created_at"
 
 
 @dataclass(frozen=True)
@@ -127,6 +156,60 @@ class Registry:
                 "SELECT chat_id FROM chat_bindings WHERE integration = ? ORDER BY created_at", (integration,)
             )
         ]
+
+    # --- pending join requests ---------------------------------------------
+
+    def add_pending(
+        self, integration: str, *, chat_id: int | None, invite_hash: str | None, title: str,
+        now: int | None = None,
+    ) -> PendingJoin:
+        """Record a join request. If the same chat/link is already pending, the existing row wins."""
+        existing = self.pending_conflict(chat_id=chat_id, invite_hash=invite_hash)
+        if existing is not None:
+            return existing
+        cur = self._db.execute(
+            "INSERT INTO pending_joins(integration, chat_id, invite_hash, title, created_at) VALUES (?, ?, ?, ?, ?)",
+            (integration, chat_id, invite_hash, title, int(time.time()) if now is None else now),
+        )
+        return self.pending(cur.lastrowid)
+
+    def pending(self, pending_id: int) -> PendingJoin | None:
+        row = self._db.execute(f"SELECT {_PENDING_COLUMNS} FROM pending_joins WHERE id = ?", (pending_id,)).fetchone()
+        return PendingJoin(*row) if row else None
+
+    def pending_conflict(self, *, chat_id: int | None, invite_hash: str | None) -> PendingJoin | None:
+        row = self._db.execute(
+            f"SELECT {_PENDING_COLUMNS} FROM pending_joins WHERE chat_id = ? OR invite_hash = ?",
+            (chat_id, invite_hash),
+        ).fetchone()
+        return PendingJoin(*row) if row else None
+
+    def pending_matches(self, chat_id: int, title: str | None) -> list[PendingJoin]:
+        """Requests a newly visible chat may belong to: by id first, else by title among id-less ones."""
+        by_id = self._db.execute(
+            f"SELECT {_PENDING_COLUMNS} FROM pending_joins WHERE chat_id = ?", (chat_id,)
+        ).fetchall()
+        if by_id:
+            return [PendingJoin(*row) for row in by_id]
+        if not title:
+            return []
+        wanted = normalize_title(title)
+        rows = self._db.execute(f"SELECT {_PENDING_COLUMNS} FROM pending_joins WHERE chat_id IS NULL").fetchall()
+        return [PendingJoin(*row) for row in rows if normalize_title(row[4]) == wanted]
+
+    def pendings(self) -> list[PendingJoin]:
+        return [PendingJoin(*row) for row in self._db.execute(
+            f"SELECT {_PENDING_COLUMNS} FROM pending_joins ORDER BY created_at"
+        )]
+
+    def remove_pending(self, pending_id: int) -> bool:
+        return self._db.execute("DELETE FROM pending_joins WHERE id = ?", (pending_id,)).rowcount > 0
+
+    def expire_pending(self, older_than: int) -> list[PendingJoin]:
+        rows = self._db.execute(
+            f"DELETE FROM pending_joins WHERE created_at < ? RETURNING {_PENDING_COLUMNS}", (older_than,)
+        ).fetchall()
+        return [PendingJoin(*row) for row in rows]
 
     def bindings(self) -> list[Binding]:
         return [

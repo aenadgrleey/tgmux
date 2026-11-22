@@ -28,13 +28,15 @@ class TelethonUpstream:
         self._handler: UpdateHandler | None = None
 
     async def start(self) -> None:
+        # Register before connect(): with catch_up the client replays missed updates
+        # (getDifference) right inside connect(), and they must not hit an empty handler list.
+        self.client.add_event_handler(self._on_raw, events.Raw)
         await self.client.connect()
         if not await self.client.is_user_authorized():
             await self.client.disconnect()
-            raise RuntimeError("Telegram session is not authorized; authorize it first (barabot setup scraper)")
+            raise RuntimeError("Telegram session is not authorized; authorize it with Telethon and point `tgmux telegram set` at it")
         me = await self.client.get_me()
         self.self_id = me.id
-        self.client.add_event_handler(self._on_raw, events.Raw)
 
     async def stop(self) -> None:
         await self.client.disconnect()

@@ -53,12 +53,38 @@ the ones the update mentions. Group calls are mapped to chats from
 `GetFullChannel`/`GetFullChat` results and `UpdateGroupCall`, so pytgcalls can
 run inside an integration on top of `SharedClient`.
 
+## Join requests
+
+Chats that need an admin's approval go through one mechanism, whether the
+integration used `JoinChannel` or a private invite link:
+
+1. Telegram answers `INVITE_REQUEST_SENT`; the integration gets that error as
+   usual and the gateway records a pending request (`chat_id` when known, the
+   invite hash, the title). It is kept in SQLite, so restarts do not lose it.
+2. While pending, the same chat or link is refused to other integrations.
+3. The first update from a chat with no owner is checked against pending
+   requests: by `chat_id` (any update), otherwise by title, but only on a
+   join signal (`UpdateChannel` for a channel we are now in, or a
+   "joined by request" / "added" service message). Exactly one match: the
+   chat is assigned and the update delivered to the new owner. Several:
+   reported to the service bot, nothing is guessed.
+4. Requests not approved in 30 days are dropped with a report.
+
+`tgmux pending` lists them, `tgmux pending cancel <id>` forgets one.
+
 ## Service bot
 
 Things tgmux drops or does not expect go to a separate BotFather bot (Bot API,
-not the shared account): updates without a chat, messages in chats nobody owns
-(once a day per chat), messages for an owner that is offline, internal errors,
-upstream disconnects. Repeats are folded per key.
+not the shared account), to exactly one configured recipient:
+
+- an integration is unavailable for more than 30 s (disconnected, or not back
+  after a gateway start), with a reminder every hour while it stays away;
+- it came back after a reported outage: how many queued updates were
+  delivered and how many were lost;
+- its queue overflowed (limit 10k) or queued updates expired (24 h): reported
+  the moment it starts happening, totals come with the "came back" report;
+- updates without a chat, messages in chats nobody owns (once a day per chat),
+  internal errors, protocol errors, upstream disconnects.
 
 ## Setup
 
@@ -100,9 +126,14 @@ Other commands: `tgmux chats [integration]`, `tgmux grant <chat_id> <integration
 ## Known limits
 
 - Updates without a chat (e.g. `UpdateDeleteMessages` in private chats and basic groups) are dropped and reported.
-- Updates for an offline integration are lost (no replay); `catch_up` is not supported.
-- `ordered=True` for batched requests is ignored.
-- Invite links that need admin approval: ownership is not assigned when the request is approved later.
+- Delivery is at-least-once and in memory only:
+  - integration offline (restart, deploy, crash): its updates wait in the gateway
+    backlog (10k per integration, 24 h) and are delivered in order on reconnect;
+  - gateway restart: the gateway runs Telethon with `catch_up=True`, so missed
+    updates are fetched with `getDifference` and land in the backlog. The update
+    state is saved about once a minute, so after a crash some updates can come
+    twice; after a very long downtime Telegram may cut the difference short;
+  - `SharedClient` itself has no `catch_up`; it relies on the gateway backlog.
 
 ## Tests
 

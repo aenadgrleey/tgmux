@@ -146,3 +146,214 @@ def test_updates_go_to_owner_only_and_unexpected_ones_are_reported():
     assert delivered == [("barabot", "UpdateNewChannelMessage")]
     assert reporter.keys() == [f"unowned:{channel_id(6)}", "no-peer:UpdateDeleteMessages"]
     assert "Чужой" in reporter.reports[0][1]
+
+
+class Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+class FakeConn:
+    def __init__(self, name):
+        self.name, self.wants_updates, self.sent = name, True, []
+
+    def send(self, kind, payload):
+        self.sent.append(payload)
+
+
+def availability_gateway(**kwargs):
+    upstream = FakeUpstream()
+    registry = registry_with("barabot")
+    registry.claim(CHAN, "barabot", "join")
+    reporter = RecordingReporter()
+    clock = Clock()
+    gw = Gateway(upstream, registry, reporter, clock=clock, offline_grace=30, **kwargs)
+    gw._mark_offline("barabot")  # what serve() does at startup
+    return upstream, reporter, clock, gw
+
+
+def push(upstream, text, msg_id):
+    run(upstream.push(types.UpdateNewChannelMessage(channel_message(5, text, msg_id=msg_id), msg_id, 1), [channel(5)]))
+
+
+def connect(gw, name):
+    """Mirrors the registration step of Gateway._handle_connection."""
+    conn = FakeConn(name)
+    gw._connections[name] = conn
+    gw._mark_online(name, *gw._flush_backlog(conn))
+    return conn
+
+
+def disconnect(gw, name):
+    del gw._connections[name]
+    gw._mark_offline(name)
+
+
+def test_unavailable_integration_is_reported_after_grace_and_reminded():
+    upstream, reporter, clock, gw = availability_gateway()
+    clock.now = 29
+    gw.sweep()
+    assert reporter.keys() == []
+    clock.now = 31
+    gw.sweep()
+    gw.sweep()
+    assert reporter.keys() == ["offline:barabot"]
+    assert "недоступна" in reporter.reports[0][1]
+    clock.now = 31 + 3600
+    gw.sweep()
+    assert reporter.keys() == ["offline:barabot", "offline:barabot"]
+    assert "всё ещё недоступна" in reporter.reports[1][1]
+
+
+def test_quick_reconnect_is_silent():
+    upstream, reporter, clock, gw = availability_gateway()
+    connect(gw, "barabot")
+    disconnect(gw, "barabot")
+    clock.now = 10
+    gw.sweep()
+    push(upstream, "hi", 1)
+    conn = connect(gw, "barabot")
+    gw.sweep()
+    assert len(conn.sent) == 1
+    assert reporter.keys() == []
+
+
+def test_return_after_reported_outage_is_reported_with_counts():
+    upstream, reporter, clock, gw = availability_gateway()
+    push(upstream, "a", 1)
+    clock.now = 60
+    gw.sweep()
+    conn = connect(gw, "barabot")
+    assert len(conn.sent) == 1
+    assert reporter.keys() == ["offline:barabot", "online:barabot"]
+    assert "доставлено из очереди: 1" in reporter.reports[1][1]
+
+
+def test_overflow_is_reported_immediately_and_summed_on_return():
+    upstream, reporter, clock, gw = availability_gateway(backlog_limit=2)
+    for i in range(1, 6):            # 5 updates, limit 2 -> 3 dropped
+        push(upstream, str(i), i)
+    assert reporter.keys() == ["backlog-overflow:barabot"]
+    assert gw.backlog_size("barabot") == 2
+    conn = connect(gw, "barabot")
+    assert len(conn.sent) == 2
+    assert reporter.keys()[-1] == "online:barabot"
+    assert "потеряно: 3 (переполнение: 3" in reporter.reports[-1][1]
+
+
+def test_ttl_expiry_is_reported_without_waiting_for_reconnect():
+    upstream, reporter, clock, gw = availability_gateway(backlog_ttl=100)
+    push(upstream, "old", 1)
+    clock.now = 50
+    push(upstream, "newer", 2)
+    clock.now = 120                  # "old" expired, "newer" not yet
+    gw.sweep()
+    assert "backlog-expired:barabot" in reporter.keys()
+    assert gw.backlog_size("barabot") == 1
+    clock.now = 130
+    conn = connect(gw, "barabot")
+    assert len(conn.sent) == 1
+    assert "старше 100 с: 1" in reporter.reports[-1][1]
+
+
+def test_removed_integration_stops_being_reported():
+    upstream, reporter, clock, gw = availability_gateway()
+    gw.registry.remove_integration("barabot")
+    clock.now = 100
+    gw.sweep()
+    assert reporter.keys() == []
+
+
+# --- pending join requests (one mechanism for JoinChannel and invite links) ---
+
+def joined_update(cid, title):
+    """What arrives when a request is approved: UpdateChannel with the (now joined) channel."""
+    return types.UpdateChannel(cid), [types.Channel(id=cid, title=title, photo=types.ChatPhotoEmpty(),
+                                                    date=channel(cid).date, access_hash=cid * 10)]
+
+
+def private_invite(title):
+    return types.ChatInvite(title=title, photo=types.PhotoEmpty(0), participants_count=3, color=0, request_needed=True)
+
+
+def test_join_channel_request_is_pending_then_assigned_by_id():
+    upstream, registry, reporter, gw = make()
+    upstream.on(functions.channels.JoinChannelRequest, lambda r: errors.InviteRequestSentError(r))
+    upstream.on(functions.channels.GetChannelsRequest, lambda r: types.messages.Chats([channel(5, "Квартиры")]))
+    with pytest.raises(errors.InviteRequestSentError):
+        run(gw.execute("barabot", functions.channels.JoinChannelRequest(types.InputChannel(5, 50))))
+    [pending] = registry.pendings()
+    assert (pending.integration, pending.chat_id, pending.title) == ("barabot", CHAN, "Квартиры")
+    assert registry.owner(CHAN) is None
+
+    # someone else cannot jump in while the request is pending
+    upstream.calls.clear()
+    with pytest.raises(ChatOwnedByOtherError):
+        run(gw.execute("lofi", functions.channels.JoinChannelRequest(types.InputChannel(5, 50))))
+    assert upstream.calls == []
+
+    delivered = []
+    gw._deliver = lambda owner, update, entities, chat: delivered.append(owner)
+    # any update from that chat id resolves it, even an ordinary message
+    run(upstream.push(types.UpdateNewChannelMessage(channel_message(5, "hi"), 1, 1), [channel(5, "Renamed")]))
+    assert registry.owner(CHAN) == "barabot" and registry.pendings() == []
+    assert delivered == ["barabot"]
+    assert reporter.keys() == []
+
+
+def test_invite_link_request_is_pending_then_assigned_by_title():
+    upstream, registry, reporter, gw = make()
+    upstream.on(functions.messages.CheckChatInviteRequest, lambda r: private_invite("Аренда Тбилиси"))
+    upstream.on(functions.messages.ImportChatInviteRequest, lambda r: errors.InviteRequestSentError(r))
+    with pytest.raises(errors.InviteRequestSentError):
+        run(gw.execute("barabot", functions.messages.ImportChatInviteRequest("abc")))
+    [pending] = registry.pendings()
+    assert (pending.chat_id, pending.invite_hash) == (None, "abc")
+
+    # same link from another integration is refused before Telegram
+    with pytest.raises(ChatOwnedByOtherError):
+        run(gw.execute("lofi", functions.messages.ImportChatInviteRequest("abc")))
+
+    gw._deliver = lambda *a: None
+    # an ordinary message in an unowned chat with the same title is NOT a join signal
+    run(upstream.push(types.UpdateNewChannelMessage(channel_message(6, "x"), 1, 1), [channel(6, "Аренда Тбилиси")]))
+    assert registry.owner(channel_id(6)) is None and len(registry.pendings()) == 1
+
+    update, entities = joined_update(7, "  аренда   тбилиси ")
+    run(upstream.push(update, entities))
+    assert registry.owner(channel_id(7)) == "barabot" and registry.pendings() == []
+
+
+def test_ambiguous_titles_are_reported_not_guessed():
+    upstream, registry, reporter, gw = make()
+    upstream.on(functions.messages.CheckChatInviteRequest, lambda r: private_invite("Flats"))
+    upstream.on(functions.messages.ImportChatInviteRequest, lambda r: errors.InviteRequestSentError(r))
+    for name, link in (("barabot", "a"), ("lofi", "b")):
+        with pytest.raises(errors.InviteRequestSentError):
+            run(gw.execute(name, functions.messages.ImportChatInviteRequest(link)))
+    update, entities = joined_update(7, "Flats")
+    run(upstream.push(update, entities))
+    assert registry.owner(channel_id(7)) is None
+    assert len(registry.pendings()) == 2
+    assert reporter.keys() == [f"pending-ambiguous:{channel_id(7)}"]
+    assert "tgmux grant" in reporter.reports[0][1]
+
+
+def test_stale_requests_expire_with_a_report():
+    upstream, registry, reporter, gw = make()
+    wall = [1_000_000.0]
+    gw._wall_clock = lambda: wall[0]
+    gw._pending_ttl = 100
+    upstream.on(functions.channels.JoinChannelRequest, lambda r: errors.InviteRequestSentError(r))
+    with pytest.raises(errors.InviteRequestSentError):
+        run(gw.execute("barabot", functions.channels.JoinChannelRequest(types.InputChannel(5, 50))))
+    wall[0] += 50
+    gw.sweep()
+    assert len(registry.pendings()) == 1
+    wall[0] += 100
+    gw.sweep()
+    assert registry.pendings() == []
+    assert any(k.startswith("pending-expired:") for k in reporter.keys())

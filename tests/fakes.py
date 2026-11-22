@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+import inspect
 from typing import Any, Callable
 
 from telethon import utils
@@ -57,6 +58,8 @@ class FakeUpstream:
                 return [types.User(id=SELF_ID, access_hash=1, first_name="service", is_self=True)]
             return updates_for([])
         result = handler(request)
+        if inspect.isawaitable(result):
+            result = await result
         if isinstance(result, Exception):
             raise result
         return result

@@ -21,11 +21,11 @@ from tgmux.peers import channel_id
 from fakes import SELF_ID, FakeUpstream, RecordingReporter, channel, channel_message, registry_with, updates_for, user
 
 
-async def start_gateway():
+async def start_gateway(**gateway_kwargs):
     upstream = FakeUpstream()
     registry = registry_with("barabot", "lofi")
     reporter = RecordingReporter()
-    gateway = Gateway(upstream, registry, reporter)
+    gateway = Gateway(upstream, registry, reporter, **gateway_kwargs)
     socket_path = Path(tempfile.mkdtemp(dir="/tmp")) / "gw.sock"  # macOS limits unix socket paths to 104 chars
     server = await gateway.serve(socket_path)
     return upstream, registry, reporter, gateway, server, socket_path
@@ -211,6 +211,104 @@ def test_internal_failure_reaches_client_and_service_bot():
             assert "boom" in reporter.reports[0][1]
         finally:
             await client.disconnect()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_updates_wait_for_an_offline_integration():
+    """Covers integration restarts and the catch_up burst right after a gateway restart."""
+    async def scenario():
+        upstream, registry, reporter, gateway, server, sock = await start_gateway()
+        registry.claim(channel_id(5), "barabot", "join")
+        for i, text in enumerate(["first", "second", "third"], start=1):
+            await upstream.push(
+                types.UpdateNewChannelMessage(channel_message(5, text, msg_id=i), i, 1), [channel(5)]
+            )
+        assert gateway.backlog_size("barabot") == 3
+
+        got = []
+        client = SharedClient("barabot", socket_path=sock, sequential_updates=True)
+        client.add_event_handler(lambda e: got.append(e.raw_text), events.NewMessage)
+        try:
+            await client.connect()
+            await wait_for(lambda: len(got) == 3)
+            assert got == ["first", "second", "third"]
+            assert gateway.backlog_size("barabot") == 0
+            await upstream.push(types.UpdateNewChannelMessage(channel_message(5, "live", msg_id=4), 4, 1), [channel(5)])
+            await wait_for(lambda: got[-1:] == ["live"])
+            assert reporter.keys() == []
+        finally:
+            await client.disconnect()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_ordered_batch_runs_one_after_another():
+    async def scenario():
+        upstream, registry, _, gateway, server, sock = await start_gateway()
+        registry.claim(channel_id(5), "barabot", "join")
+        started, finished = [], []
+
+        async def slow_first(request):
+            started.append(request.message)
+            await asyncio.sleep(0.2 if request.message == "first" else 0)
+            finished.append(request.message)
+            if request.message == "second":
+                return errors.ChatWriteForbiddenError(request)
+            return updates_for([])
+        upstream.on(functions.messages.SendMessageRequest, slow_first)
+
+        peer = types.InputPeerChannel(5, 50)
+        batch = lambda: [functions.messages.SendMessageRequest(peer, text, random_id=i)
+                         for i, text in enumerate(["first", "second", "third"], start=1)]
+        client = SharedClient("barabot", socket_path=sock)
+        try:
+            await client.connect()
+
+            # ordered: strictly sequential; an error in the middle does not stop the rest
+            with pytest.raises(errors.MultiError) as info:
+                await client(batch(), ordered=True)
+            assert started == finished == ["first", "second", "third"]
+            assert isinstance(info.value.exceptions[1], errors.ChatWriteForbiddenError)
+            assert info.value.exceptions[0] is None and info.value.exceptions[2] is None
+
+            # unordered: all start at once, the slow one finishes last
+            started.clear(); finished.clear()
+            with pytest.raises(errors.MultiError):
+                await client(batch())
+            assert finished[-1] == "first" and len(started) == 3
+        finally:
+            await client.disconnect()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_socket_disconnect_is_noticed_and_reported():
+    async def scenario():
+        now = [0.0]
+        upstream, registry, reporter, gateway, server, sock = await start_gateway(clock=lambda: now[0])
+        client = SharedClient("barabot", socket_path=sock)
+        try:
+            await client.connect()
+            await wait_for(lambda: "barabot" in gateway.connected())
+            now[0] = 100
+            gateway.sweep()
+            assert "offline:barabot" not in reporter.keys()   # connected
+            assert "offline:lofi" in reporter.keys()          # never came
+            await client.disconnect()
+            await wait_for(lambda: "barabot" not in gateway.connected())
+            now[0] = 200
+            gateway.sweep()
+            assert "offline:barabot" in reporter.keys()
+        finally:
+            await client.disconnect()
+            await gateway.close()
             server.close()
             await server.wait_closed()
 

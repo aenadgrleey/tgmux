@@ -53,9 +53,12 @@ async def _serve(cfg: config_mod.Config) -> int:
         reporter = BotReporter(cfg.reporter.token(), cfg.reporter.chat_id)
         reporter.start()
 
-    upstream = TelethonUpstream(TelegramClient(str(cfg.session), api_id, api_hash))
+    # catch_up: after a gateway restart Telethon replays what was missed (getDifference)
+    # from the update state saved in the session; the gateway backlog holds it until
+    # integrations reconnect.
+    upstream = TelethonUpstream(TelegramClient(str(cfg.session), api_id, api_hash, catch_up=True))
+    gateway = Gateway(upstream, registry, reporter)  # installs the update handler before start()
     await upstream.start()
-    gateway = Gateway(upstream, registry, reporter)
     server = await gateway.serve(cfg.socket)
 
     stop = asyncio.Event()
@@ -76,6 +79,7 @@ async def _serve(cfg: config_mod.Config) -> int:
 
     server.close()
     await server.wait_closed()
+    await gateway.close()
     await upstream.stop()
     if isinstance(reporter, BotReporter):
         await asyncio.sleep(1)  # let the last report go out
@@ -146,6 +150,24 @@ def cmd_release(args) -> int:
     if not _registry(cfg).release(args.chat_id):
         raise SystemExit(f"chat {args.chat_id} has no owner")
     print(f"chat {args.chat_id} released")
+    return 0
+
+
+# --- pending join requests ---------------------------------------------------
+
+def cmd_pending(args) -> int:
+    import time
+
+    registry = _registry(_load(args))
+    if args.action == "cancel":
+        if not registry.remove_pending(args.id):
+            raise SystemExit(f"no pending join request #{args.id}")
+        print(f"join request #{args.id} cancelled")
+        return 0
+    now = int(time.time())
+    for p in registry.pendings():
+        age_h = (now - p.created_at) // 3600
+        print(f"#{p.id}\t{p.integration}\t{p.chat_id or '-'}\t{p.invite_hash or '-'}\t{p.title}\t{age_h}h")
     return 0
 
 
@@ -262,6 +284,13 @@ def build_parser() -> argparse.ArgumentParser:
     release = sub.add_parser("release", help="remove a chat's owner")
     release.add_argument("chat_id", type=int)
     release.set_defaults(func=cmd_release)
+
+    pending = sub.add_parser("pending", help="join requests waiting for approval")
+    pending.set_defaults(func=cmd_pending, action="list")
+    pending_sub = pending.add_subparsers(dest="action")
+    pending_sub.add_parser("list", help="list pending join requests")
+    cancel = pending_sub.add_parser("cancel", help="forget a pending join request")
+    cancel.add_argument("id", type=int)
 
     reporter = sub.add_parser("reporter", help="service bot for reports").add_subparsers(dest="action", required=True)
     rset = reporter.add_parser("set", help="configure the service bot and its only recipient")

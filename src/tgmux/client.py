@@ -112,6 +112,7 @@ class GatewaySender:
 
         self._ids = itertools.count(1)
         self._pending: dict[int, tuple[TLRequest, asyncio.Future]] = {}
+        self._ordered_tasks: set[asyncio.Task] = set()
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._recv_task: asyncio.Task | None = None
@@ -141,9 +142,41 @@ class GatewaySender:
         if not self._user_connected:
             raise ConnectionError("Cannot send requests while disconnected")
         if utils.is_list_like(request):
-            # The gateway runs every request independently; ``ordered`` is not supported.
+            if ordered:
+                return self._send_ordered(list(request), dc_id)
             return [self._enqueue(r, dc_id) for r in request]
         return self._enqueue(request, dc_id)
+
+    def _send_ordered(self, requests: list[TLRequest], dc_id: int) -> list[asyncio.Future]:
+        """Like MTProto invokeAfterMsg: send each request only after the previous one
+        has an answer (result or error). The gateway runs CALLs concurrently, so the
+        ordering has to come from here."""
+        loop = asyncio.get_running_loop()
+        outer = [loop.create_future() for _ in requests]
+
+        async def run() -> None:
+            try:
+                for request, out in zip(requests, outer):
+                    try:
+                        result = await self._enqueue(request, dc_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        if not out.done():
+                            out.set_exception(exc)
+                    else:
+                        if not out.done():
+                            out.set_result(result)
+            except asyncio.CancelledError:
+                for out in outer:
+                    if not out.done():
+                        out.set_exception(ConnectionError("Disconnected from the tgmux gateway"))
+                raise
+
+        task = loop.create_task(run())
+        self._ordered_tasks.add(task)
+        task.add_done_callback(self._ordered_tasks.discard)
+        return outer
 
     async def disconnect(self) -> None:
         self._user_connected = False
@@ -154,6 +187,8 @@ class GatewaySender:
                     await task
                 except asyncio.CancelledError:
                     pass
+        for task in list(self._ordered_tasks):
+            task.cancel()
         self._close_transport(ConnectionError("Disconnected from the tgmux gateway"))
         self._lock.release()
         if self._disconnected is not None and not self._disconnected.done():
