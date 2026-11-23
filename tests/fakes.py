@@ -55,7 +55,7 @@ class FakeUpstream:
         handler = self.handlers.get(type(request))
         if handler is None:
             if isinstance(request, functions.users.GetUsersRequest):
-                return [types.User(id=SELF_ID, access_hash=1, first_name="service", is_self=True)]
+                return [types.User(id=self.self_id, access_hash=1, first_name="service", is_self=True)]
             return updates_for([])
         result = handler(request)
         if inspect.isawaitable(result):

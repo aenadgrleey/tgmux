@@ -1,7 +1,13 @@
 """tgmux configuration (TOML).
 
-Default location: ``~/.config/tgmux/config.toml`` (override with ``--config``
-or ``TGMUX_CONFIG``)::
+One *instance* = one gateway = one Telegram account. Instances are named
+(``--instance`` / ``TGMUX_INSTANCE``, default ``main``) and fully separate:
+
+    ~/.config/tgmux/<instance>/config.toml        (root: TGMUX_CONFIG_ROOT)
+    ~/.local/state/tgmux/<instance>/              (root: TGMUX_STATE_ROOT)
+        tgmux.db  gateway.sock  locks/  gateway.lock
+
+``--config`` / ``TGMUX_CONFIG`` point at a config file directly. Example::
 
     socket = "~/.local/state/tgmux/gateway.sock"
     db     = "~/.local/state/tgmux/tgmux.db"
@@ -21,15 +27,47 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-CONFIG_DIR = Path.home() / ".config/tgmux"
-STATE_DIR = Path.home() / ".local/state/tgmux"
-DEFAULT_CONFIG = CONFIG_DIR / "config.toml"
+DEFAULT_INSTANCE = "main"
+INSTANCE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+
+
+def config_root() -> Path:
+    return Path(os.environ.get("TGMUX_CONFIG_ROOT") or Path.home() / ".config/tgmux").expanduser()
+
+
+def state_root() -> Path:
+    return Path(os.environ.get("TGMUX_STATE_ROOT") or Path.home() / ".local/state/tgmux").expanduser()
+
+
+def instance_name(name: str | None = None) -> str:
+    name = name or os.environ.get("TGMUX_INSTANCE") or DEFAULT_INSTANCE
+    if not INSTANCE_RE.fullmatch(name):
+        raise ConfigError(f"instance name must match {INSTANCE_RE.pattern}: {name!r}")
+    return name
+
+
+def default_socket(instance: str | None = None) -> Path:
+    """Where SharedClient looks for an instance's gateway unless told otherwise."""
+    return state_root() / instance_name(instance) / "gateway.sock"
+
+
+def account_lock(self_id: int) -> Path:
+    """Shared by all instances: one running gateway per Telegram account."""
+    return state_root() / "accounts" / f"{self_id}.lock"
+
+
+def instances() -> list[str]:
+    root = config_root()
+    if not root.is_dir():
+        return []
+    return sorted(p.name for p in root.iterdir() if (p / "config.toml").is_file() and INSTANCE_RE.fullmatch(p.name))
 
 
 class ConfigError(ValueError):
@@ -53,6 +91,7 @@ class Reporter:
 
 @dataclass(frozen=True)
 class Config:
+    instance: str
     path: Path
     socket: Path
     db: Path
@@ -97,10 +136,11 @@ def read_raw(path: Path) -> dict:
         raise ConfigError(f"{path}: {exc}") from None
 
 
-def parse(path: Path, data: dict) -> Config:
-    state_dir = _path(data.get("state_dir")) or STATE_DIR
+def parse(path: Path, data: dict, instance: str) -> Config:
+    state_dir = _path(data.get("state_dir")) or state_root() / instance
     telegram = data.get("telegram", {})
     return Config(
+        instance=instance,
         path=path,
         socket=_path(data.get("socket")) or state_dir / "gateway.sock",
         db=_path(data.get("db")) or state_dir / "tgmux.db",
@@ -111,13 +151,17 @@ def parse(path: Path, data: dict) -> Config:
     )
 
 
-def config_path(path: str | Path | None = None) -> Path:
-    return Path(path or os.environ.get("TGMUX_CONFIG") or DEFAULT_CONFIG).expanduser()
+def config_path(path: str | Path | None = None, instance: str | None = None) -> Path:
+    explicit = path or os.environ.get("TGMUX_CONFIG")
+    if explicit:
+        return Path(explicit).expanduser()
+    return config_root() / instance_name(instance) / "config.toml"
 
 
-def load(path: str | Path | None = None) -> Config:
-    path = config_path(path)
-    return parse(path, read_raw(path))
+def load(path: str | Path | None = None, instance: str | None = None) -> Config:
+    instance = instance_name(instance)
+    path = config_path(path, instance)
+    return parse(path, read_raw(path), instance)
 
 
 # --- writing -----------------------------------------------------------------
@@ -156,14 +200,14 @@ def write_private(path: Path, content: str) -> None:
         raise
 
 
-def update(path: Path, table: str, values: dict | None) -> Config:
+def update(path: Path, table: str, values: dict | None, instance: str | None = None) -> Config:
     """Replace one [table] (None removes it), validate, then write."""
     data = read_raw(path)
     if values is None:
         data.pop(table, None)
     else:
         data[table] = values
-    config = parse(path, data)  # refuse to write an invalid config
+    config = parse(path, data, instance_name(instance))  # refuse to write an invalid config
     write_private(path, dump(data))
     return config
 

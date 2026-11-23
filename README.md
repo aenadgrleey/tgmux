@@ -33,6 +33,35 @@ Only Telethon's transport (`_sender`) is replaced; `_call`, retries, flood
 waits, events and the entity cache are stock Telethon. Telethon is pinned
 because these are internals; `tests/test_end_to_end.py` guards them.
 
+## Several accounts: instances
+
+One instance = one gateway = one Telegram account. Instances are named and do
+not share anything (config, registry, socket, locks, reports):
+
+```
+~/.config/tgmux/<instance>/config.toml      root: $TGMUX_CONFIG_ROOT
+~/.local/state/tgmux/<instance>/            root: $TGMUX_STATE_ROOT
+    tgmux.db  gateway.sock  locks/  gateway.lock
+```
+
+Every command takes `--instance NAME` (or `$TGMUX_INSTANCE`, default `main`);
+`tgmux instances` lists them and shows which are running. Integrations pick
+the account the same way:
+
+```python
+SharedClient("barabot")                      # $TGMUX_INSTANCE, else "main"
+SharedClient("barabot", instance="second")   # another account
+```
+
+The same integration name can be connected to several instances at once.
+Socket lookup order: `socket_path=` > `instance=` > `$TGMUX_SOCKET` > `$TGMUX_INSTANCE`.
+
+A gateway refuses to start if its instance is already running, if another
+instance serves the same session file (Telegram would revoke the auth key), or
+if another instance serves the same account through a different session (both
+would route every update); the error names the instance holding it. Reports
+are prefixed `tgmux[<instance>]`.
+
 ## Ownership rules
 
 | What the integration does | Result |
@@ -102,12 +131,12 @@ tgmux integration add barabot
 printf '%s' "$BOT_TOKEN" | tgmux reporter set --chat-id 123456789 --token-stdin
 #   or: tgmux reporter set --chat-id 123456789 --token-file /path/to/token [--no-verify]
 
-tgmux serve
+tgmux serve                          # same with --instance NAME for other accounts
 ```
 
 `reporter set` sends a test message first and writes nothing if the bot cannot
 reach the recipient (the user must have pressed /start in the bot). Settings
-live in `~/.config/tgmux/config.toml` (0600):
+live in `~/.config/tgmux/<instance>/config.toml` (0600):
 
 ```toml
 [telegram]
@@ -121,7 +150,7 @@ chat_id    = 123456789          # required whenever token_file is set
 
 Other commands: `tgmux chats [integration]`, `tgmux grant <chat_id> <integration>`,
 `tgmux release <chat_id>`, `tgmux integration list|remove`,
-`tgmux reporter show|test|disable`.
+`tgmux reporter show|test|disable`, `tgmux instances`.
 
 ## Known limits
 

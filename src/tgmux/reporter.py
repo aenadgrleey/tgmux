@@ -65,7 +65,9 @@ class Deduplicator:
 class BotReporter:
     """Sends reports to the one configured peer via a BotFather bot. Never blocks the caller."""
 
-    def __init__(self, token: str, chat_id: int, *, window: float = 3600, queue_size: int = 500) -> None:
+    def __init__(self, token: str, chat_id: int, *, prefix: str = "tgmux", window: float = 3600,
+                 queue_size: int = 500) -> None:
+        self._prefix = prefix
         self._token = token
         self._chat_id = chat_id
         self._dedup = Deduplicator(window)
@@ -99,7 +101,7 @@ class BotReporter:
         while True:
             text = await self._queue.get()
             try:
-                await asyncio.to_thread(send_bot_message, self._token, self._chat_id, "tgmux: " + text)
+                await asyncio.to_thread(send_bot_message, self._token, self._chat_id, f"{self._prefix}: {text}")
             except Exception:  # reporting must never take the gateway down
                 log.exception("failed to deliver report to the service bot")
                 await asyncio.sleep(5)

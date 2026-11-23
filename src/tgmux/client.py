@@ -21,13 +21,20 @@ from telethon.sessions import MemorySession
 from telethon.tl import types
 from telethon.tl.tlobject import TLRequest
 
+from tgmux import config as config_mod
 from tgmux import protocol
 from tgmux.errors import GatewayRejectedError, IntegrationInUseError, ProtocolError
 from tgmux.protocol import Frame
 
 log = logging.getLogger(__name__)
 
-DEFAULT_SOCKET = Path(os.environ.get("TGMUX_SOCKET", Path.home() / ".local/state/tgmux/gateway.sock"))
+def resolve_socket(instance: str | None = None, socket_path: str | Path | None = None) -> Path:
+    """socket_path > explicit instance > TGMUX_SOCKET > TGMUX_INSTANCE (default "main")."""
+    if socket_path is not None:
+        return Path(socket_path)
+    if instance is None and os.environ.get("TGMUX_SOCKET"):
+        return Path(os.environ["TGMUX_SOCKET"])
+    return config_mod.default_socket(instance)
 
 UpdatesHandler = Callable[[types.Updates], Awaitable[None]]
 
@@ -333,7 +340,8 @@ class GatewaySender:
 class SharedClient(TelegramClient):
     """Drop-in TelegramClient backed by the tgmux gateway.
 
-    >>> client = SharedClient("barabot")
+    >>> client = SharedClient("barabot")                     # instance from TGMUX_INSTANCE, else "main"
+    >>> other = SharedClient("barabot", instance="second")   # another account's gateway
     >>> await client.start()
     """
 
@@ -341,13 +349,14 @@ class SharedClient(TelegramClient):
         self,
         integration: str,
         *,
-        socket_path: str | Path = DEFAULT_SOCKET,
+        instance: str | None = None,
+        socket_path: str | Path | None = None,
         **kwargs: Any,
     ) -> None:
         kwargs["catch_up"] = False  # the gateway does not replay missed updates
         super().__init__(MemorySession(), api_id=1, api_hash="0" * 32, **kwargs)
         self._sender = GatewaySender(
-            socket_path,
+            resolve_socket(instance, socket_path),
             integration,
             on_updates=self._on_gateway_updates,
             receive_updates=not self._no_updates,

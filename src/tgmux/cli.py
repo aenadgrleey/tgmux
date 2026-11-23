@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import fcntl
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
@@ -22,18 +22,31 @@ def _registry(cfg: config_mod.Config) -> Registry:
 
 # --- serve -------------------------------------------------------------------
 
-@contextlib.contextmanager
-def _single_instance(lock_file: Path):
-    lock_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    handle = lock_file.open("w")
+class LockBusy(RuntimeError):
+    def __init__(self, path: Path, holder: str) -> None:
+        super().__init__(f"{path} is held by {holder}")
+        self.path, self.holder = path, holder
+
+
+def hold_lock(path: Path, label: str):
+    """Take an flock and write ``label`` into the file; raise LockBusy with the holder's label."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    handle = os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        raise SystemExit(f"another tgmux gateway is already running (lock {lock_file})")
-    try:
-        yield
-    finally:
+        holder = handle.read().strip() or "?"
         handle.close()
+        raise LockBusy(path, holder) from None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{label}\n")
+    handle.flush()
+    return handle
+
+
+def _label(cfg) -> str:
+    return f"instance {cfg.instance} (pid {os.getpid()})"
 
 
 async def _serve(cfg: config_mod.Config) -> int:
@@ -47,10 +60,16 @@ async def _serve(cfg: config_mod.Config) -> int:
         raise SystemExit(f"Telegram session not found ({cfg.session}); run `tgmux telegram set --session ... --credentials ...`")
     api_id, api_hash = config_mod.api_credentials(cfg)
 
+    # Two gateways on one session file would get the auth key revoked by Telegram.
+    try:
+        session_lock = hold_lock(cfg.session.with_name(cfg.session.name + ".tgmux.lock"), _label(cfg))
+    except LockBusy as busy:
+        raise SystemExit(f"session {cfg.session} is already served by {busy.holder}")
+
     registry = _registry(cfg)
     reporter = LogReporter()
     if cfg.reporter is not None:
-        reporter = BotReporter(cfg.reporter.token(), cfg.reporter.chat_id)
+        reporter = BotReporter(cfg.reporter.token(), cfg.reporter.chat_id, prefix=f"tgmux[{cfg.instance}]")
         reporter.start()
 
     # catch_up: after a gateway restart Telethon replays what was missed (getDifference)
@@ -59,6 +78,12 @@ async def _serve(cfg: config_mod.Config) -> int:
     upstream = TelethonUpstream(TelegramClient(str(cfg.session), api_id, api_hash, catch_up=True))
     gateway = Gateway(upstream, registry, reporter)  # installs the update handler before start()
     await upstream.start()
+    # Two gateways on one account (different session files) would both route every update.
+    try:
+        account_lock = hold_lock(config_mod.account_lock(upstream.self_id), _label(cfg))
+    except LockBusy as busy:
+        await upstream.stop()
+        raise SystemExit(f"account {upstream.self_id} is already served by {busy.holder}")
     server = await gateway.serve(cfg.socket)
 
     stop = asyncio.Event()
@@ -81,6 +106,8 @@ async def _serve(cfg: config_mod.Config) -> int:
     await server.wait_closed()
     await gateway.close()
     await upstream.stop()
+    account_lock.close()
+    session_lock.close()
     if isinstance(reporter, BotReporter):
         await asyncio.sleep(1)  # let the last report go out
         await reporter.stop()
@@ -89,10 +116,28 @@ async def _serve(cfg: config_mod.Config) -> int:
 
 def cmd_serve(args) -> int:
     cfg = _load(args)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(level=logging.INFO, format=f"%(asctime)s %(levelname)s [{cfg.instance}] %(name)s: %(message)s")
     logging.getLogger("telethon").setLevel(logging.WARNING)
-    with _single_instance(cfg.lock_file):
+    try:
+        instance_lock = hold_lock(cfg.lock_file, _label(cfg))
+    except LockBusy as busy:
+        raise SystemExit(f"instance {cfg.instance} is already running: {busy.holder}")
+    try:
         return asyncio.run(_serve(cfg))
+    finally:
+        instance_lock.close()
+
+
+def cmd_instances(args) -> int:
+    for name in config_mod.instances():
+        cfg = config_mod.load(None, name)
+        running = "stopped"
+        try:
+            hold_lock(cfg.lock_file, "probe").close()
+        except LockBusy as busy:
+            running = f"running ({busy.holder})"
+        print(f"{name}\t{running}\t{cfg.socket}")
+    return 0
 
 
 # --- integrations ------------------------------------------------------------
@@ -177,11 +222,11 @@ def cmd_telegram_set(args) -> int:
     for path in (args.session, args.credentials):
         if not path.expanduser().exists():
             raise SystemExit(f"not found: {path}")
-    path = config_mod.config_path(args.config)
+    path = config_mod.config_path(args.config, args.instance)
     config_mod.update(path, "telegram", {
         "session": str(args.session.expanduser().resolve()),
         "credentials": str(args.credentials.expanduser().resolve()),
-    })
+    }, args.instance)
     print(f"[telegram] written to {path}")
     return 0
 
@@ -192,7 +237,7 @@ def _read_token(args) -> tuple[str, Path | None]:
         token = args.token_file.expanduser().read_text().strip()
         return token, None
     token = sys.stdin.read().strip()
-    return token, config_mod.config_path(args.config).parent / "reporter.token"
+    return token, config_mod.config_path(args.config, args.instance).parent / "reporter.token"
 
 
 def cmd_reporter_set(args) -> int:
@@ -217,15 +262,15 @@ def cmd_reporter_set(args) -> int:
         token_file = save_to
     else:
         token_file = args.token_file.expanduser().resolve()
-    path = config_mod.config_path(args.config)
-    config_mod.update(path, "reporter", {"token_file": str(token_file), "chat_id": args.chat_id})
+    path = config_mod.config_path(args.config, args.instance)
+    config_mod.update(path, "reporter", {"token_file": str(token_file), "chat_id": args.chat_id}, args.instance)
     print(f"reports go to {args.chat_id}; [reporter] written to {path}")
     return 0
 
 
 def cmd_reporter_disable(args) -> int:
-    path = config_mod.config_path(args.config)
-    config_mod.update(path, "reporter", None)
+    path = config_mod.config_path(args.config, args.instance)
+    config_mod.update(path, "reporter", None, args.instance)
     print(f"[reporter] removed from {path}; reports go to the log only")
     return 0
 
@@ -257,10 +302,12 @@ def cmd_reporter_test(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tgmux", description=__doc__)
-    parser.add_argument("--config", help="path to config.toml")
+    parser.add_argument("--instance", help="gateway instance = one Telegram account (default: $TGMUX_INSTANCE or main)")
+    parser.add_argument("--config", help="path to config.toml (default: ~/.config/tgmux/<instance>/config.toml)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("serve", help="run the gateway").set_defaults(func=cmd_serve)
+    sub.add_parser("instances", help="list configured instances").set_defaults(func=cmd_instances)
 
     integration = sub.add_parser("integration", help="manage integrations").add_subparsers(dest="action", required=True)
     for action, func, helptext in (
@@ -314,7 +361,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _load(args) -> config_mod.Config:
-    return config_mod.load(args.config)
+    return config_mod.load(args.config, args.instance)
 
 
 def main(argv: list[str] | None = None) -> int:
