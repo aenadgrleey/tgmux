@@ -30,7 +30,7 @@ def roots(tmp_path, monkeypatch):
 
 def test_each_instance_gets_its_own_paths(roots):
     main, second = config.load(), config.load(instance="second")
-    assert main.instance == "main" and main.path == roots / "conf/main/config.toml"
+    assert main.instance == "default" and main.path == roots / "conf/default/config.toml"
     assert second.db == roots / "st/second/tgmux.db"
     assert second.socket == roots / "st/second/gateway.sock"
     assert len({main.db, second.db, main.socket, second.socket, main.lock_file, second.lock_file}) == 6
@@ -44,7 +44,7 @@ def test_instance_name_from_env_and_validation(roots, monkeypatch):
 
 
 def test_client_socket_resolution(roots, monkeypatch):
-    assert resolve_socket() == roots / "st/main/gateway.sock"
+    assert resolve_socket() == roots / "st/default/gateway.sock"
     assert resolve_socket("second") == roots / "st/second/gateway.sock"
     monkeypatch.setenv("TGMUX_SOCKET", "/tmp/custom.sock")
     assert resolve_socket() == config.Path("/tmp/custom.sock")
@@ -63,14 +63,14 @@ def test_cli_commands_are_per_instance(roots, capsys):
 
 
 def test_instances_lists_and_shows_running(roots, capsys):
-    for name in ("main", "second"):
+    for name in ("default", "second"):
         cli.main(["--instance", name, "telegram", "set", "--session", __file__, "--credentials", __file__])
     held = cli.hold_lock(config.load(instance="second").lock_file, "instance second (pid 42)")
     try:
         capsys.readouterr()
         cli.main(["instances"])
         lines = capsys.readouterr().out.splitlines()
-        assert lines[0].startswith("main\tstopped")
+        assert lines[0].startswith("default\tstopped")
         assert lines[1].startswith("second\trunning (instance second (pid 42))")
     finally:
         held.close()
@@ -173,4 +173,5 @@ def test_instances_without_a_tty(tmp_path):
         result = subprocess.run([sys.executable, "-m", "tgmux", *step], env=env, stdin=subprocess.DEVNULL,
                                 capture_output=True, text=True, timeout=20)
         assert result.returncode == 0, (step, result.stderr)
-    assert result.stdout.startswith("a\tstopped")
+    names = [line.split("\t")[:2] for line in result.stdout.splitlines()]
+    assert names == [["default", "stopped"], ["a", "stopped"]]  # default is always listed, first

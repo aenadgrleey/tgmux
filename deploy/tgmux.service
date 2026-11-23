@@ -1,23 +1,22 @@
-# tgmux gateway, production instance "prod" on the VPS.
+# tgmux gateway on the VPS (instance "default").
 #
 # Code:   /opt/tgmux (git work tree, venv in /opt/tgmux/.venv)
-# Config: /root/.config/tgmux/prod/        config.toml, telegram.env, reporter.token
-# State:  /root/.local/state/tgmux/prod/   telegram.session, tgmux.db, gateway.sock, locks/
+# Config: /root/.config/tgmux/default/     config.toml, telegram.env, reporter.token
+# State:  /root/.local/state/tgmux/default/ telegram.session, tgmux.db, gateway.sock, locks/
 #
 # Install once:
-#   cp /opt/tgmux/deploy/tgmux-prod.service /etc/systemd/system/
-#   systemctl daemon-reload && systemctl enable --now tgmux-prod
-# Logs:  journalctl -u tgmux-prod -f
+#   cp /opt/tgmux/deploy/tgmux.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now tgmux
+# Logs:  journalctl -u tgmux -f
 
 [Unit]
-Description=tgmux gateway (instance prod)
+Description=tgmux gateway
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-Environment=TGMUX_INSTANCE=prod
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/opt/tgmux
 ExecStartPre=/opt/tgmux/.venv/bin/tgmux serve --check

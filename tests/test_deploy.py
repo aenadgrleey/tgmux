@@ -139,7 +139,7 @@ def test_created_directories_are_private(tmp_path):
     from tgmux import config
     from tgmux.registry import Registry
 
-    Registry(tmp_path / "root" / "state" / "prod" / "tgmux.db")
-    for d in ("root", "root/state", "root/state/prod"):
+    Registry(tmp_path / "root" / "state" / "default" / "tgmux.db")
+    for d in ("root", "root/state", "root/state/default"):
         assert stat.S_IMODE((tmp_path / d).stat().st_mode) == 0o700, d
     assert config.private_dir(tmp_path / "root") == tmp_path / "root"  # existing: untouched

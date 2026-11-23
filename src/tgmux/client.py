@@ -29,7 +29,7 @@ from tgmux.protocol import Frame
 log = logging.getLogger(__name__)
 
 def resolve_socket(instance: str | None = None, socket_path: str | Path | None = None) -> Path:
-    """socket_path > explicit instance > TGMUX_SOCKET > TGMUX_INSTANCE (default "main")."""
+    """socket_path > explicit instance > TGMUX_SOCKET > TGMUX_INSTANCE (default "default")."""
     if socket_path is not None:
         return Path(socket_path)
     if instance is None and os.environ.get("TGMUX_SOCKET"):
@@ -362,7 +362,7 @@ class GatewaySender:
 class SharedClient(TelegramClient):
     """Drop-in TelegramClient backed by the tgmux gateway.
 
-    >>> client = SharedClient("barabot")                     # instance from TGMUX_INSTANCE, else "main"
+    >>> client = SharedClient("barabot")                     # instance from TGMUX_INSTANCE, else "default"
     >>> other = SharedClient("barabot", instance="second")   # another account's gateway
     >>> await client.start()
     """

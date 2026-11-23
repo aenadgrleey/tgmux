@@ -415,7 +415,7 @@ def cmd_reporter_test(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tgmux", description=__doc__)
-    parser.add_argument("--instance", help="gateway instance = one Telegram account (default: $TGMUX_INSTANCE or main)")
+    parser.add_argument("--instance", help="gateway instance = one Telegram account (default: $TGMUX_INSTANCE or default)")
     parser.add_argument("--config", help="path to config.toml (default: ~/.config/tgmux/<instance>/config.toml)")
     sub = parser.add_subparsers(dest="command", required=True)
 

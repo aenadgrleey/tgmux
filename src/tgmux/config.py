@@ -1,7 +1,8 @@
 """tgmux configuration (TOML).
 
 One *instance* = one gateway = one Telegram account. Instances are named
-(``--instance`` / ``TGMUX_INSTANCE``, default ``main``) and fully separate:
+(``--instance`` / ``TGMUX_INSTANCE``, default ``default``) and fully separate.
+Anything run without an instance goes to ``default``, which always exists:
 
     ~/.config/tgmux/<instance>/config.toml        (root: TGMUX_CONFIG_ROOT)
     ~/.local/state/tgmux/<instance>/              (root: TGMUX_STATE_ROOT)
@@ -34,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-DEFAULT_INSTANCE = "main"
+DEFAULT_INSTANCE = "default"
 INSTANCE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 
 
@@ -64,10 +65,12 @@ def account_lock(self_id: int) -> Path:
 
 
 def instances() -> list[str]:
+    """Configured instances; ``default`` is always listed, configured or not."""
     root = config_root()
-    if not root.is_dir():
-        return []
-    return sorted(p.name for p in root.iterdir() if (p / "config.toml").is_file() and INSTANCE_RE.fullmatch(p.name))
+    names = {DEFAULT_INSTANCE}
+    if root.is_dir():
+        names |= {p.name for p in root.iterdir() if (p / "config.toml").is_file() and INSTANCE_RE.fullmatch(p.name)}
+    return sorted(names, key=lambda n: (n != DEFAULT_INSTANCE, n))
 
 
 class ConfigError(ValueError):

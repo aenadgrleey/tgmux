@@ -36,14 +36,14 @@ ref=${1:-origin/master}
 prod_root=/opt/tgmux
 python="$prod_root/.venv/bin/python"
 tgmux="$prod_root/.venv/bin/tgmux"
-unit=tgmux-prod.service
-export TGMUX_INSTANCE=prod
+unit=tgmux.service
+unset TGMUX_INSTANCE   # the gateway runs the default instance
 settle=10   # seconds the gateway must stay up after a restart
 
 if [[ $mode == dry-run ]]; then
     printf 'DRY RUN: git -C %q fetch, checkout --detach %q\n' "$prod_root" "$ref"
-    printf 'DRY RUN: %q -m pip install -e %q, then %q serve --check (instance %s)\n' \
-        "$python" "$prod_root" "$tgmux" "$TGMUX_INSTANCE"
+    printf 'DRY RUN: %q -m pip install -e %q, then %q serve --check\n' \
+        "$python" "$prod_root" "$tgmux"
     printf 'DRY RUN: systemctl restart %q, require it active after %ss; on failure restore the previous commit\n' \
         "$unit" "$settle"
     exit 0

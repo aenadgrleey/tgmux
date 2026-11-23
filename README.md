@@ -44,12 +44,13 @@ not share anything (config, registry, socket, locks, reports):
     tgmux.db  gateway.sock  locks/  gateway.lock
 ```
 
-Every command takes `--instance NAME` (or `$TGMUX_INSTANCE`, default `main`);
+Every command takes `--instance NAME` (or `$TGMUX_INSTANCE`, default `default`);
+anything run without one goes to `default`, which always exists;
 `tgmux instances` lists them and shows which are running. Integrations pick
 the account the same way:
 
 ```python
-SharedClient("barabot")                      # $TGMUX_INSTANCE, else "main"
+SharedClient("barabot")                      # $TGMUX_INSTANCE, else "default"
 SharedClient("barabot", instance="second")   # another account
 ```
 
@@ -154,13 +155,15 @@ Other commands: `tgmux chats [integration]`, `tgmux grant <chat_id> <integration
 
 ## Deploy: dev on the laptop, prod on the VPS
 
-Two instances of the same Telegram account, each with its **own session**
-(own auth key, logged in separately), like a phone and a desktop:
+An instance is a tgmux thing (one gateway = one Telegram account on one
+machine), not an environment. Dev and prod are machines; each runs its
+gateway in the `default` instance with its **own session** of the same
+account (own auth key, logged in separately), like a phone and a desktop:
 
-| | where | instance | how it runs |
-|---|---|---|---|
-| dev | laptop | `dev` | `tgmux --instance dev serve` by hand |
-| prod | VPS | `prod` | systemd `tgmux-prod.service`, code in `/opt/tgmux` |
+| | where | how it runs |
+|---|---|---|
+| dev | laptop | `tgmux serve` by hand |
+| prod | VPS | systemd `tgmux.service`, code in `/opt/tgmux` |
 
 Never copy a session file between machines: two live copies of one auth key
 make Telegram revoke it. Both gateways see every update of the account, so
@@ -174,16 +177,15 @@ git clone https://github.com/aenadgrleey/tgmux.git /opt/tgmux
 python3 -m venv /opt/tgmux/.venv && /opt/tgmux/.venv/bin/pip install -e /opt/tgmux
 ln -s /opt/tgmux/.venv/bin/tgmux /usr/local/bin/tgmux
 ln -s /opt/tgmux/deploy/prod.sh /usr/local/bin/tgmux-deploy
-export TGMUX_INSTANCE=prod
 
 tgmux telegram login                 # asks API_ID/API_HASH, phone, code, 2FA
 tgmux integration add barabot
-tgmux reporter set --chat-id 123456789 --token-file /root/.config/tgmux/prod/reporter.token
+tgmux reporter set --chat-id 123456789 --token-file /root/.config/tgmux/default/reporter.token
 tgmux serve --check                  # offline: config, session, credentials, registry
 
-cp /opt/tgmux/deploy/tgmux-prod.service /etc/systemd/system/
-systemctl daemon-reload && systemctl enable --now tgmux-prod
-journalctl -u tgmux-prod -f
+cp /opt/tgmux/deploy/tgmux.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now tgmux
+journalctl -u tgmux -f
 ```
 
 Updates, on the server (`ssh` in first):
@@ -200,9 +202,9 @@ to stay up for 10 s; otherwise it restores the previous commit and restarts
 that. If the ref is already deployed and running, it does nothing. The server
 pulls with a read-only deploy key (`Host github-tgmux` in `/root/.ssh/config`).
 
-Integrations reach the gateway at `/root/.local/state/tgmux/prod/gateway.sock`
-(`TGMUX_INSTANCE=prod`). In their systemd unit that path must be writable
-(`ProtectHome=read-only` + `ReadWritePaths=/root/.local/state/tgmux/prod`;
+Integrations reach the gateway at `/root/.local/state/tgmux/default/gateway.sock`
+(no `TGMUX_INSTANCE` needed). In their systemd unit that path must be writable
+(`ProtectHome=read-only` + `ReadWritePaths=/root/.local/state/tgmux/default`;
 `ProtectHome=true` hides it). `SharedClient` waits for the gateway forever
 with backoff up to 30 s, so integrations survive gateway restarts and may
 start before it; pass `connection_retries=N` to give up instead.
