@@ -11,8 +11,9 @@
 #                                  moved; silent otherwise; skips a commit that already failed
 #
 # Validation is `tgmux serve --check`: offline, never opens a second Telegram
-# connection with the session the running gateway uses. Results go to the
-# reporter bot (`tgmux reporter send`) when it is configured.
+# connection with the session the running gateway uses. Results are logged to
+# journald as tgmux-deploy (notice on success, error on failure); whatever reads
+# the journal decides where they go.
 set -Eeuo pipefail
 
 # The checkout below rewrites this very file; bash reads scripts lazily, so run from a copy.
@@ -66,8 +67,8 @@ else
     flock -w 300 9 || { printf 'error: another deploy is still running\n' >&2; exit 1; }
 fi
 
-notify() {
-    "$tgmux" reporter send "$1" >/dev/null 2>&1 || true
+log_event() {   # $1: syslog priority (notice, err), $2: text
+    logger -t tgmux-deploy -p "user.$1" -- "$2" 2>/dev/null || printf '%s\n' "$2" >&2
 }
 
 git_root=(git -C "$root")
@@ -156,7 +157,7 @@ started_ok() {
 
 failed() {   # $1: what failed
     printf '%s\n' "$target" > "$failed_file"
-    notify "❌ деплой ${target:0:7} (${ref}) не прошёл: $1. Откат на ${old_ref:0:7}. Автодеплой ждёт следующего push в prod."
+    log_event err "❌ деплой ${target:0:7} (${ref}) не прошёл: $1. Откат на ${old_ref:0:7}. Автодеплой ждёт следующего push в prod."
 }
 
 "${git_root[@]}" checkout --detach --quiet "$target"
@@ -170,7 +171,7 @@ fi
 if started_ok; then
     rm -f -- "$failed_file"
     printf '%s is active at %s\n' "$unit" "$target"
-    notify "🚀 выкачено ${target:0:7} (${ref}, было ${old_ref:0:7})${changes:+$'\n'$changes}"
+    log_event notice "🚀 выкачено ${target:0:7} (${ref}, было ${old_ref:0:7})${changes:+$'\n'$changes}"
     exit 0
 fi
 

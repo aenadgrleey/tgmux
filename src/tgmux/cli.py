@@ -58,7 +58,7 @@ async def _serve(cfg: config_mod.Config) -> int:
     from telethon import TelegramClient
 
     from tgmux.gateway import Gateway
-    from tgmux.reporter import BotReporter, LogReporter
+    from tgmux.events import EventLog
     from tgmux.upstream import TelethonUpstream
 
     if cfg.session is None or not cfg.session.exists():
@@ -72,16 +72,13 @@ async def _serve(cfg: config_mod.Config) -> int:
         raise SystemExit(f"session {cfg.session} is already served by {busy.holder}")
 
     registry = _registry(cfg)
-    reporter = LogReporter()
-    if cfg.reporter is not None:
-        reporter = BotReporter(cfg.reporter.token(), cfg.reporter.chat_id, prefix=f"tgmux[{cfg.instance}]")
-        reporter.start()
+    events = EventLog()
 
     # catch_up: after a gateway restart Telethon replays what was missed (getDifference)
     # from the update state saved in the session; the gateway backlog holds it until
     # integrations reconnect.
     upstream = TelethonUpstream(TelegramClient(str(cfg.session), api_id, api_hash, catch_up=True))
-    gateway = Gateway(upstream, registry, reporter, auto_register=cfg.auto_register)  # installs the update handler before start()
+    gateway = Gateway(upstream, registry, events, auto_register=cfg.auto_register)  # installs the update handler before start()
     await upstream.start()
     # Two gateways on one account (different session files) would both route every update.
     try:
@@ -98,11 +95,11 @@ async def _serve(cfg: config_mod.Config) -> int:
 
     stop_wait = loop.create_task(stop.wait())
     upstream_lost = when_disconnected(upstream.client)
-    reporter.report("lifecycle", "шлюз запущен", window=0)
+    events.report("lifecycle", "шлюз запущен", window=0)
     await asyncio.wait({stop_wait, upstream_lost}, return_when=asyncio.FIRST_COMPLETED)
     exit_code = 0
     if upstream_lost.done() and not stop.is_set():
-        reporter.report("upstream-lost", "соединение с Telegram потеряно, шлюз завершается", window=0)
+        events.report("upstream-lost", "соединение с Telegram потеряно, шлюз завершается", window=0)
         exit_code = 1
     stop_wait.cancel()
     upstream_lost.cancel()
@@ -113,9 +110,6 @@ async def _serve(cfg: config_mod.Config) -> int:
     await upstream.stop()
     account_lock.close()
     session_lock.close()
-    if isinstance(reporter, BotReporter):
-        await asyncio.sleep(1)  # let the last report go out
-        await reporter.stop()
     return exit_code
 
 
@@ -151,11 +145,6 @@ def check(cfg: config_mod.Config) -> list[str]:
         config_mod.api_credentials(cfg)
     except (config_mod.ConfigError, OSError, ValueError) as exc:
         problems.append(f"API credentials: {exc}")
-    if cfg.reporter is not None:
-        try:
-            cfg.reporter.token()
-        except (config_mod.ConfigError, OSError) as exc:
-            problems.append(f"reporter: {exc}")
     try:
         registry = _registry(cfg)
         if not registry.integrations() and not cfg.auto_register:
@@ -178,8 +167,9 @@ def cmd_serve(args) -> int:
             return 1
         print(f"instance {cfg.instance}: ok ({cfg.path})")
         return 0
-    logging.basicConfig(level=logging.INFO, format=f"%(asctime)s %(levelname)s [{cfg.instance}] %(name)s: %(message)s")
-    logging.getLogger("telethon").setLevel(logging.WARNING)
+    from tgmux.events import setup_logging
+
+    setup_logging(cfg.instance)
     try:
         instance_lock = hold_lock(cfg.lock_file, _label(cfg))
     except LockBusy as busy:
@@ -278,7 +268,7 @@ def cmd_pending(args) -> int:
     return 0
 
 
-# --- telegram / reporter settings (non-interactive) -------------------------
+# --- telegram settings ------------------------------------------------------
 
 def cmd_telegram_set(args) -> int:
     for path in (args.session, args.credentials):
@@ -458,91 +448,6 @@ def cmd_telegram_login(args) -> int:
     return 0
 
 
-def _read_token(args) -> tuple[str, Path | None]:
-    """Return (token, file to save it to or None if it already lives in a file)."""
-    if args.token_file is not None:
-        token = args.token_file.expanduser().read_text().strip()
-        return token, None
-    token = sys.stdin.read().strip()
-    return token, config_mod.config_path(args.config, args.instance).parent / "reporter.token"
-
-
-def cmd_reporter_set(args) -> int:
-    from tgmux.reporter import BotApiError, send_bot_message
-
-    try:
-        token, save_to = _read_token(args)
-    except FileNotFoundError as exc:
-        raise SystemExit(f"token file not found: {exc.filename}")
-    if not token:
-        raise SystemExit("empty bot token")
-    if not args.no_verify:
-        # Nothing is written unless the bot can actually reach the recipient.
-        try:
-            send_bot_message(token, args.chat_id, "tgmux: отчёты будут приходить сюда")
-        except BotApiError as exc:
-            raise SystemExit(f"the bot cannot write to {args.chat_id}: {exc} (press /start in the bot first)")
-        except OSError as exc:
-            raise SystemExit(f"cannot reach the Bot API: {exc} (use --no-verify to skip)")
-    if save_to is not None:
-        config_mod.write_private(save_to, token + "\n")
-        token_file = save_to
-    else:
-        token_file = args.token_file.expanduser().resolve()
-    path = config_mod.config_path(args.config, args.instance)
-    config_mod.update(path, "reporter", {"token_file": str(token_file), "chat_id": args.chat_id}, args.instance)
-    print(f"reports go to {args.chat_id}; [reporter] written to {path}")
-    return 0
-
-
-def cmd_reporter_disable(args) -> int:
-    path = config_mod.config_path(args.config, args.instance)
-    config_mod.update(path, "reporter", None, args.instance)
-    print(f"[reporter] removed from {path}; reports go to the log only")
-    return 0
-
-
-def cmd_reporter_show(args) -> int:
-    cfg = _load(args)
-    if cfg.reporter is None:
-        print("not configured")
-    else:
-        print(f"chat_id\t{cfg.reporter.chat_id}\ntoken_file\t{cfg.reporter.token_file}")
-    return 0
-
-
-def cmd_reporter_test(args) -> int:
-    from tgmux.reporter import BotApiError, send_bot_message
-
-    cfg = _load(args)
-    if cfg.reporter is None:
-        raise SystemExit("reporter is not configured; run `tgmux reporter set`")
-    try:
-        send_bot_message(cfg.reporter.token(), cfg.reporter.chat_id, "tgmux: тестовый отчёт")
-    except BotApiError as exc:
-        raise SystemExit(f"Bot API error: {exc}")
-    print("sent")
-    return 0
-
-
-def cmd_reporter_send(args) -> int:
-    """Send a free-form message to the reporter's recipient (used by tgmux-deploy)."""
-    from tgmux.reporter import BotApiError, send_bot_message
-
-    cfg = _load(args)
-    if cfg.reporter is None:
-        print("reporter is not configured; message not sent", file=sys.stderr)
-        return 1
-    text = " ".join(args.text) if args.text else sys.stdin.read()
-    if not text.strip():
-        raise SystemExit("empty message")
-    try:
-        send_bot_message(cfg.reporter.token(), cfg.reporter.chat_id, f"tgmux[{cfg.instance}]: {text.strip()}")
-    except (BotApiError, OSError) as exc:
-        raise SystemExit(f"cannot send: {exc}")
-    return 0
-
-
 # --- entry point -------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -587,21 +492,6 @@ def build_parser() -> argparse.ArgumentParser:
     cancel = pending_sub.add_parser("cancel", help="forget a pending join request")
     cancel.add_argument("id", type=int)
 
-    reporter = sub.add_parser("reporter", help="service bot for reports").add_subparsers(dest="action", required=True)
-    rset = reporter.add_parser("set", help="configure the service bot and its only recipient")
-    rset.add_argument("--chat-id", type=int, required=True, help="the one peer reports go to (must have pressed /start)")
-    token = rset.add_mutually_exclusive_group(required=True)
-    token.add_argument("--token-file", type=Path, help="existing file with the BotFather token")
-    token.add_argument("--token-stdin", action="store_true",
-                       help="read the token from stdin and store it 0600 next to the config")
-    rset.add_argument("--no-verify", action="store_true", help="do not send a test message before saving")
-    rset.set_defaults(func=cmd_reporter_set)
-    reporter.add_parser("disable", help="remove the service bot settings").set_defaults(func=cmd_reporter_disable)
-    reporter.add_parser("show", help="print the reporter settings").set_defaults(func=cmd_reporter_show)
-    reporter.add_parser("test", help="send a test report").set_defaults(func=cmd_reporter_test)
-    rsend = reporter.add_parser("send", help="send a message to the reporter's recipient (text or stdin)")
-    rsend.add_argument("text", nargs="*")
-    rsend.set_defaults(func=cmd_reporter_send)
 
     telegram = sub.add_parser("telegram", help="Telegram session settings").add_subparsers(dest="action", required=True)
     tset = telegram.add_parser("set", help="point the gateway at an authorized Telethon session")

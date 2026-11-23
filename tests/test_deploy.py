@@ -11,7 +11,7 @@ from telethon.tl import types
 from tgmux import SharedClient, cli
 from tgmux.gateway import Gateway
 
-from fakes import FakeUpstream, RecordingReporter, registry_with
+from fakes import FakeUpstream, RecordingEvents, registry_with
 
 
 def _session(path: Path, auth_key: bytes | None) -> Path:
@@ -77,7 +77,7 @@ def test_client_waits_for_a_gateway_that_starts_later():
         connecting = asyncio.ensure_future(client.connect())
         await asyncio.sleep(0.3)
         assert not connecting.done()
-        gateway = Gateway(FakeUpstream(), registry_with("barabot"), RecordingReporter())
+        gateway = Gateway(FakeUpstream(), registry_with("barabot"), RecordingEvents())
         server = await gateway.serve(sock)
         try:
             await asyncio.wait_for(connecting, 3)
@@ -96,7 +96,7 @@ def test_client_survives_a_long_gateway_restart():
     async def scenario():
         sock = Path(tempfile.mkdtemp(dir="/tmp")) / "gw.sock"
         registry = registry_with("barabot")
-        gateway = Gateway(FakeUpstream(), registry, RecordingReporter())
+        gateway = Gateway(FakeUpstream(), registry, RecordingEvents())
         server = await gateway.serve(sock)
         client = SharedClient("barabot", socket_path=sock, retry_delay=0.02)
         await client.connect()
@@ -107,7 +107,7 @@ def test_client_survives_a_long_gateway_restart():
             sock.unlink(missing_ok=True)
             await asyncio.sleep(0.5)   # ~10 attempts at the 0.02 s base delay, capped backoff
             assert client.is_connected()  # still trying, not given up
-            gateway = Gateway(FakeUpstream(), registry, RecordingReporter())
+            gateway = Gateway(FakeUpstream(), registry, RecordingEvents())
             server = await gateway.serve(sock)
             deadline = asyncio.get_running_loop().time() + 5
             while "barabot" not in gateway.connected():

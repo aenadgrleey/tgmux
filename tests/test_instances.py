@@ -15,7 +15,7 @@ from tgmux.client import resolve_socket
 from tgmux.gateway import Gateway
 from tgmux.peers import channel_id
 
-from fakes import FakeUpstream, RecordingReporter, channel, channel_message, registry_with
+from fakes import FakeUpstream, RecordingEvents, channel, channel_message, registry_with
 
 
 @pytest.fixture
@@ -111,7 +111,7 @@ def test_one_integration_in_two_instances_at_once():
         upstream = FakeUpstream()
         upstream.self_id = self_id
         registry = registry_with("barabot")
-        gateway = Gateway(upstream, registry, RecordingReporter())
+        gateway = Gateway(upstream, registry, RecordingEvents())
         sock = Path(tempfile.mkdtemp(dir="/tmp")) / name / "gateway.sock"  # macOS: 104-char socket paths
         return upstream, registry, gateway, await gateway.serve(sock), sock
 
@@ -145,26 +145,6 @@ def test_one_integration_in_two_instances_at_once():
                 await srv.wait_closed()
 
     asyncio.run(scenario())
-
-
-def test_reports_carry_the_instance_name(monkeypatch):
-    from tgmux import reporter as reporter_mod
-
-    sent = []
-    monkeypatch.setattr(reporter_mod, "send_bot_message", lambda token, chat, text: sent.append(text))
-
-    async def scenario():
-        bot = reporter_mod.BotReporter("t", 1, prefix="tgmux[second]")
-        bot.start()
-        bot.report("k", "hello", window=0)
-        for _ in range(100):
-            if sent:
-                break
-            await asyncio.sleep(0.01)
-        await bot.stop()
-
-    asyncio.run(scenario())
-    assert sent == ["tgmux[second]: hello"]
 
 
 def test_instances_without_a_tty(tmp_path):

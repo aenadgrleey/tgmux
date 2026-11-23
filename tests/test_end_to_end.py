@@ -18,17 +18,17 @@ from tgmux import ChatNotOwnedError, GatewayRejectedError, IntegrationInUseError
 from tgmux.gateway import Gateway
 from tgmux.peers import channel_id
 
-from fakes import SELF_ID, FakeUpstream, RecordingReporter, channel, channel_message, registry_with, updates_for, user
+from fakes import SELF_ID, FakeUpstream, RecordingEvents, channel, channel_message, registry_with, updates_for, user
 
 
 async def start_gateway(**gateway_kwargs):
     upstream = FakeUpstream()
     registry = registry_with("barabot", "lofi")
-    reporter = RecordingReporter()
-    gateway = Gateway(upstream, registry, reporter, **gateway_kwargs)
+    recorded = RecordingEvents()
+    gateway = Gateway(upstream, registry, recorded, **gateway_kwargs)
     socket_path = Path(tempfile.mkdtemp(dir="/tmp")) / "gw.sock"  # macOS limits unix socket paths to 104 chars
     server = await gateway.serve(socket_path)
-    return upstream, registry, reporter, gateway, server, socket_path
+    return upstream, registry, recorded, gateway, server, socket_path
 
 
 async def wait_for(predicate, timeout=2.0):
@@ -41,7 +41,7 @@ async def wait_for(predicate, timeout=2.0):
 
 def test_shared_client_full_flow():
     async def scenario():
-        upstream, registry, reporter, gateway, server, sock = await start_gateway()
+        upstream, registry, recorded, gateway, server, sock = await start_gateway()
         barabot = SharedClient("barabot", socket_path=sock)
         lofi = SharedClient("lofi", socket_path=sock)
         got_barabot, got_lofi = [], []
@@ -130,16 +130,16 @@ def test_unknown_integration_is_rejected_without_auto_register():
 
 def test_unknown_integration_registers_itself_on_connect():
     async def scenario():
-        _, registry, reporter, gateway, server, sock = await start_gateway()
+        _, registry, recorded, gateway, server, sock = await start_gateway()
         client = SharedClient("newbie", socket_path=sock)
         try:
             await client.connect()
             assert registry.has_integration("newbie")
             assert gateway.connected() == ["newbie"]
-            assert "registered:newbie" in reporter.keys()
+            assert "registered:newbie" in recorded.keys()
             await client.disconnect()
             await client.connect()  # second time: already registered, no new report
-            assert reporter.keys().count("registered:newbie") == 1
+            assert recorded.keys().count("registered:newbie") == 1
         finally:
             await client.disconnect()
             await gateway.close()
@@ -234,7 +234,7 @@ time.sleep(60)
 
 def test_internal_failure_reaches_client_and_service_bot():
     async def scenario():
-        upstream, registry, reporter, gateway, server, sock = await start_gateway()
+        upstream, registry, recorded, gateway, server, sock = await start_gateway()
         registry.claim(channel_id(5), "barabot", "join")
         upstream.on(functions.messages.SendMessageRequest, lambda r: RuntimeError("boom"))
         client = SharedClient("barabot", socket_path=sock)
@@ -244,8 +244,8 @@ def test_internal_failure_reaches_client_and_service_bot():
                 await client.send_message(types.InputPeerChannel(5, 50), "hi")
             assert info.value.message == "TGMUX_INTERNAL"
             assert len(upstream.called(functions.messages.SendMessageRequest)) == 1  # not retried
-            assert reporter.keys() == ["call-error:SendMessageRequest:RuntimeError"]
-            assert "boom" in reporter.reports[0][1]
+            assert recorded.keys() == ["call-error:SendMessageRequest:RuntimeError"]
+            assert "boom" in recorded.reports[0][1]
         finally:
             await client.disconnect()
             server.close()
@@ -257,7 +257,7 @@ def test_internal_failure_reaches_client_and_service_bot():
 def test_updates_wait_for_an_offline_integration():
     """Covers integration restarts and the catch_up burst right after a gateway restart."""
     async def scenario():
-        upstream, registry, reporter, gateway, server, sock = await start_gateway()
+        upstream, registry, recorded, gateway, server, sock = await start_gateway()
         registry.claim(channel_id(5), "barabot", "join")
         for i, text in enumerate(["first", "second", "third"], start=1):
             await upstream.push(
@@ -275,7 +275,7 @@ def test_updates_wait_for_an_offline_integration():
             assert gateway.backlog_size("barabot") == 0
             await upstream.push(types.UpdateNewChannelMessage(channel_message(5, "live", msg_id=4), 4, 1), [channel(5)])
             await wait_for(lambda: got[-1:] == ["live"])
-            assert reporter.keys() == []
+            assert recorded.keys() == []
         finally:
             await client.disconnect()
             server.close()
@@ -329,20 +329,20 @@ def test_ordered_batch_runs_one_after_another():
 def test_socket_disconnect_is_noticed_and_reported():
     async def scenario():
         now = [0.0]
-        upstream, registry, reporter, gateway, server, sock = await start_gateway(clock=lambda: now[0])
+        upstream, registry, recorded, gateway, server, sock = await start_gateway(clock=lambda: now[0])
         client = SharedClient("barabot", socket_path=sock)
         try:
             await client.connect()
             await wait_for(lambda: "barabot" in gateway.connected())
             now[0] = 100
             gateway.sweep()
-            assert "offline:barabot" not in reporter.keys()   # connected
-            assert "offline:lofi" in reporter.keys()          # never came
+            assert "offline:barabot" not in recorded.keys()   # connected
+            assert "offline:lofi" in recorded.keys()          # never came
             await client.disconnect()
             await wait_for(lambda: "barabot" not in gateway.connected())
             now[0] = 200
             gateway.sweep()
-            assert "offline:barabot" in reporter.keys()
+            assert "offline:barabot" in recorded.keys()
         finally:
             await client.disconnect()
             await gateway.close()

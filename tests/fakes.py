@@ -10,7 +10,7 @@ from telethon.tl import functions, types
 from telethon.tl.tlobject import TLObject
 
 from tgmux.registry import Registry
-from tgmux.reporter import Deduplicator
+from tgmux.events import Deduplicator
 
 SELF_ID = 777
 NOW = datetime.datetime(2026, 11, 22, tzinfo=datetime.timezone.utc)
@@ -76,7 +76,7 @@ class FakeUpstream:
         return [c for c in self.calls if isinstance(c, request_type)]
 
 
-class RecordingReporter:
+class RecordingEvents:
     def __init__(self) -> None:
         self.reports: list[tuple[str, str]] = []
         self._dedup = Deduplicator(3600)

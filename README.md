@@ -102,15 +102,26 @@ integration used `JoinChannel` or a private invite link:
    join signal (`UpdateChannel` for a channel we are now in, or a
    "joined by request" / "added" service message). Exactly one match: the
    chat is assigned and the update delivered to the new owner. Several:
-   reported to the service bot, nothing is guessed.
+   logged as a warning, nothing is guessed.
 4. Requests not approved in 30 days are dropped with a report.
 
 `tgmux pending` lists them, `tgmux pending cancel <id>` forgets one.
 
-## Service bot
+## Events
 
-Things tgmux drops or does not expect go to a separate BotFather bot (Bot API,
-not the shared account), to exactly one configured recipient:
+tgmux only logs. What it drops, does not expect, or wants noticed is written
+to the log with a syslog level; under systemd the lines carry a `<N>` prefix,
+so journald stores the priority. Where they go from there (a chat bot, mail,
+nowhere) is the host's business: on aenaut a separate journald forwarder,
+aenaut-notify, sends `notice` and above to Telegram. tgmux has no bot, token
+or recipient settings. Repeats of one event are folded (once an hour by
+default, once a day for a chat nobody owns).
+
+- `error`: internal errors, protocol errors, Telegram connection lost;
+- `warning`: problems below;
+- `notice`: gateway started, new integration registered, integration back online.
+
+Logged events:
 
 - an integration is unavailable for more than 30 s (disconnected, or not back
   after a gateway start), with a reminder every hour while it stays away;
@@ -133,30 +144,20 @@ tgmux telegram set --session ~/Dev/barabot/config/scraper.session \
                    --credentials ~/Dev/barabot/config/scraper.env
 tgmux integration add barabot
 
-# optional service bot; --chat-id is mandatory and is the only recipient
-printf '%s' "$BOT_TOKEN" | tgmux reporter set --chat-id 123456789 --token-stdin
-#   or: tgmux reporter set --chat-id 123456789 --token-file /path/to/token [--no-verify]
-
 tgmux serve                          # same with --instance NAME for other accounts
 ```
 
-`reporter set` sends a test message first and writes nothing if the bot cannot
-reach the recipient (the user must have pressed /start in the bot). Settings
-live in `~/.config/tgmux/<instance>/config.toml` (0600):
+Settings live in `~/.config/tgmux/<instance>/config.toml` (0600):
 
 ```toml
 [telegram]
 session     = "/Users/me/Dev/barabot/config/scraper.session"
 credentials = "/Users/me/Dev/barabot/config/scraper.env"
-
-[reporter]
-token_file = "/Users/me/.config/tgmux/reporter.token"
-chat_id    = 123456789          # required whenever token_file is set
 ```
 
 Other commands: `tgmux chats [integration]`, `tgmux grant <chat_id> <integration>`,
 `tgmux release <chat_id>`, `tgmux integration list|remove`,
-`tgmux reporter show|test|send|disable`, `tgmux instances`.
+`tgmux instances`.
 
 ## Deploy on a server
 
@@ -179,7 +180,6 @@ ln -s /opt/tgmux/deploy/deploy.sh /usr/local/bin/tgmux-deploy
 tgmux telegram login                 # asks API_ID/API_HASH, phone, code, 2FA
 #   or: tgmux telegram login --qr   # scan with the phone where the account is open; no code
 tgmux integration add barabot
-tgmux reporter set --chat-id 123456789 --token-file /root/.config/tgmux/default/reporter.token
 tgmux serve --check                  # offline: config, session, credentials, registry
 
 cp /opt/tgmux/deploy/tgmux.service /opt/tgmux/deploy/tgmux-deploy.{service,timer} /etc/systemd/system/
@@ -195,8 +195,8 @@ git push origin dev:prod     # fast-forward only: prod never gets ahead of dev
 ```
 
 `tgmux-deploy.timer` runs `tgmux-deploy --auto` every minute: it fetches, and
-if `origin/prod` moved it deploys it (same steps as below). The reporter bot
-says "🚀 deployed" or "❌ failed, rolled back". A commit that failed is not
+if `origin/prod` moved it deploys it (same steps as below). It logs
+"🚀 deployed" (notice) or "❌ failed, rolled back" (error) as `tgmux-deploy`. A commit that failed is not
 retried until `prod` moves again; the timer never starts a gateway you
 stopped on purpose; a manual `tgmux-deploy` waits for a running auto-deploy.
 Turn it off with `systemctl disable --now tgmux-deploy.timer`; logs are in

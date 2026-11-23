@@ -18,12 +18,9 @@ Anything run without an instance goes to ``default``, which always exists:
     session     = "~/Dev/barabot/config/scraper.session"  # authorized Telethon session
     credentials = "~/Dev/barabot/config/scraper.env"      # API_ID=... / API_HASH=...
 
-    [reporter]                                            # optional service bot
-    token_file = "~/.config/tgmux/reporter.token"         # BotFather token, file mode 0600
-    chat_id    = 123456789                                # required with token_file: the only recipient
 
-Everything can be written without prompts: ``tgmux telegram set`` and
-``tgmux reporter set`` (see ``tgmux --help``).
+Everything can be written without prompts: ``tgmux telegram set``
+(see ``tgmux --help``). Events go to the log only; see tgmux.events.
 """
 from __future__ import annotations
 
@@ -79,21 +76,6 @@ class ConfigError(ValueError):
 
 
 @dataclass(frozen=True)
-class Reporter:
-    token_file: Path
-    chat_id: int
-
-    def token(self) -> str:
-        try:
-            token = self.token_file.read_text().strip()
-        except FileNotFoundError:
-            raise ConfigError(f"reporter token file not found: {self.token_file}") from None
-        if not token:
-            raise ConfigError(f"reporter token file is empty: {self.token_file}")
-        return token
-
-
-@dataclass(frozen=True)
 class Config:
     instance: str
     path: Path
@@ -102,7 +84,6 @@ class Config:
     state_dir: Path
     session: Path | None
     credentials: Path | None
-    reporter: Reporter | None
     auto_register: bool = True
 
     @property
@@ -122,19 +103,6 @@ def _bool(value: Any, key: str) -> bool:
     if not isinstance(value, bool):
         raise ConfigError(f"{key} must be true or false, got {value!r}")
     return value
-
-
-def _reporter(section: dict) -> Reporter | None:
-    token_file, chat_id = section.get("token_file"), section.get("chat_id")
-    if token_file is None and chat_id is None:
-        return None
-    if token_file is None:
-        raise ConfigError("[reporter].chat_id is set but [reporter].token_file is missing")
-    if chat_id is None:
-        raise ConfigError("[reporter].chat_id is required when [reporter].token_file is set")
-    if not isinstance(chat_id, int) or isinstance(chat_id, bool):
-        raise ConfigError(f"[reporter].chat_id must be an integer, got {chat_id!r}")
-    return Reporter(_path(token_file), chat_id)
 
 
 def read_raw(path: Path) -> dict:
@@ -158,7 +126,6 @@ def parse(path: Path, data: dict, instance: str) -> Config:
         state_dir=state_dir,
         session=_path(telegram.get("session")),
         credentials=_path(telegram.get("credentials")),
-        reporter=_reporter(data.get("reporter", {})),
         auto_register=_bool(data.get("auto_register", True), "auto_register"),
     )
 

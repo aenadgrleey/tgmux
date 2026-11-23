@@ -9,7 +9,7 @@ from tgmux.errors import ChatNotOwnedError, ChatOwnedByOtherError, RequestNotAll
 from tgmux.gateway import Gateway
 from tgmux.peers import channel_id
 
-from fakes import FakeUpstream, RecordingReporter, channel, channel_message, registry_with, updates_for, user
+from fakes import FakeUpstream, RecordingEvents, channel, channel_message, registry_with, updates_for, user
 
 CHAN = channel_id(5)
 
@@ -17,8 +17,8 @@ CHAN = channel_id(5)
 def make():
     upstream = FakeUpstream()
     registry = registry_with("barabot", "lofi")
-    reporter = RecordingReporter()
-    return upstream, registry, reporter, Gateway(upstream, registry, reporter)
+    recorded = RecordingEvents()
+    return upstream, registry, recorded, Gateway(upstream, registry, recorded)
 
 
 def run(coro):
@@ -131,7 +131,7 @@ def test_dialogs_only_list_owned_chats():
 
 
 def test_updates_go_to_owner_only_and_unexpected_ones_are_reported():
-    upstream, registry, reporter, gw = make()
+    upstream, registry, recorded, gw = make()
     delivered = []
     gw._deliver = lambda owner, update, entities, chat: delivered.append((owner, type(update).__name__))
     registry.claim(CHAN, "barabot", "join")
@@ -144,8 +144,8 @@ def test_updates_go_to_owner_only_and_unexpected_ones_are_reported():
     run(scenario())
 
     assert delivered == [("barabot", "UpdateNewChannelMessage")]
-    assert reporter.keys() == [f"unowned:{channel_id(6)}", "no-peer:UpdateDeleteMessages"]
-    assert "Чужой" in reporter.reports[0][1]
+    assert recorded.keys() == [f"unowned:{channel_id(6)}", "no-peer:UpdateDeleteMessages"]
+    assert "Чужой" in recorded.reports[0][1]
 
 
 class Clock:
@@ -168,11 +168,11 @@ def availability_gateway(**kwargs):
     upstream = FakeUpstream()
     registry = registry_with("barabot")
     registry.claim(CHAN, "barabot", "join")
-    reporter = RecordingReporter()
+    recorded = RecordingEvents()
     clock = Clock()
-    gw = Gateway(upstream, registry, reporter, clock=clock, offline_grace=30, **kwargs)
+    gw = Gateway(upstream, registry, recorded, clock=clock, offline_grace=30, **kwargs)
     gw._mark_offline("barabot")  # what serve() does at startup
-    return upstream, reporter, clock, gw
+    return upstream, recorded, clock, gw
 
 
 def push(upstream, text, msg_id):
@@ -193,23 +193,23 @@ def disconnect(gw, name):
 
 
 def test_unavailable_integration_is_reported_after_grace_and_reminded():
-    upstream, reporter, clock, gw = availability_gateway()
+    upstream, recorded, clock, gw = availability_gateway()
     clock.now = 29
     gw.sweep()
-    assert reporter.keys() == []
+    assert recorded.keys() == []
     clock.now = 31
     gw.sweep()
     gw.sweep()
-    assert reporter.keys() == ["offline:barabot"]
-    assert "недоступна" in reporter.reports[0][1]
+    assert recorded.keys() == ["offline:barabot"]
+    assert "недоступна" in recorded.reports[0][1]
     clock.now = 31 + 3600
     gw.sweep()
-    assert reporter.keys() == ["offline:barabot", "offline:barabot"]
-    assert "всё ещё недоступна" in reporter.reports[1][1]
+    assert recorded.keys() == ["offline:barabot", "offline:barabot"]
+    assert "всё ещё недоступна" in recorded.reports[1][1]
 
 
 def test_quick_reconnect_is_silent():
-    upstream, reporter, clock, gw = availability_gateway()
+    upstream, recorded, clock, gw = availability_gateway()
     connect(gw, "barabot")
     disconnect(gw, "barabot")
     clock.now = 10
@@ -218,53 +218,53 @@ def test_quick_reconnect_is_silent():
     conn = connect(gw, "barabot")
     gw.sweep()
     assert len(conn.sent) == 1
-    assert reporter.keys() == []
+    assert recorded.keys() == []
 
 
 def test_return_after_reported_outage_is_reported_with_counts():
-    upstream, reporter, clock, gw = availability_gateway()
+    upstream, recorded, clock, gw = availability_gateway()
     push(upstream, "a", 1)
     clock.now = 60
     gw.sweep()
     conn = connect(gw, "barabot")
     assert len(conn.sent) == 1
-    assert reporter.keys() == ["offline:barabot", "online:barabot"]
-    assert "доставлено из очереди: 1" in reporter.reports[1][1]
+    assert recorded.keys() == ["offline:barabot", "online:barabot"]
+    assert "доставлено из очереди: 1" in recorded.reports[1][1]
 
 
 def test_overflow_is_reported_immediately_and_summed_on_return():
-    upstream, reporter, clock, gw = availability_gateway(backlog_limit=2)
+    upstream, recorded, clock, gw = availability_gateway(backlog_limit=2)
     for i in range(1, 6):            # 5 updates, limit 2 -> 3 dropped
         push(upstream, str(i), i)
-    assert reporter.keys() == ["backlog-overflow:barabot"]
+    assert recorded.keys() == ["backlog-overflow:barabot"]
     assert gw.backlog_size("barabot") == 2
     conn = connect(gw, "barabot")
     assert len(conn.sent) == 2
-    assert reporter.keys()[-1] == "online:barabot"
-    assert "потеряно: 3 (переполнение: 3" in reporter.reports[-1][1]
+    assert recorded.keys()[-1] == "online:barabot"
+    assert "потеряно: 3 (переполнение: 3" in recorded.reports[-1][1]
 
 
 def test_ttl_expiry_is_reported_without_waiting_for_reconnect():
-    upstream, reporter, clock, gw = availability_gateway(backlog_ttl=100)
+    upstream, recorded, clock, gw = availability_gateway(backlog_ttl=100)
     push(upstream, "old", 1)
     clock.now = 50
     push(upstream, "newer", 2)
     clock.now = 120                  # "old" expired, "newer" not yet
     gw.sweep()
-    assert "backlog-expired:barabot" in reporter.keys()
+    assert "backlog-expired:barabot" in recorded.keys()
     assert gw.backlog_size("barabot") == 1
     clock.now = 130
     conn = connect(gw, "barabot")
     assert len(conn.sent) == 1
-    assert "старше 100 с: 1" in reporter.reports[-1][1]
+    assert "старше 100 с: 1" in recorded.reports[-1][1]
 
 
 def test_removed_integration_stops_being_reported():
-    upstream, reporter, clock, gw = availability_gateway()
+    upstream, recorded, clock, gw = availability_gateway()
     gw.registry.remove_integration("barabot")
     clock.now = 100
     gw.sweep()
-    assert reporter.keys() == []
+    assert recorded.keys() == []
 
 
 # --- pending join requests (one mechanism for JoinChannel and invite links) ---
@@ -280,7 +280,7 @@ def private_invite(title):
 
 
 def test_join_channel_request_is_pending_then_assigned_by_id():
-    upstream, registry, reporter, gw = make()
+    upstream, registry, recorded, gw = make()
     upstream.on(functions.channels.JoinChannelRequest, lambda r: errors.InviteRequestSentError(r))
     upstream.on(functions.channels.GetChannelsRequest, lambda r: types.messages.Chats([channel(5, "Квартиры")]))
     with pytest.raises(errors.InviteRequestSentError):
@@ -301,11 +301,11 @@ def test_join_channel_request_is_pending_then_assigned_by_id():
     run(upstream.push(types.UpdateNewChannelMessage(channel_message(5, "hi"), 1, 1), [channel(5, "Renamed")]))
     assert registry.owner(CHAN) == "barabot" and registry.pendings() == []
     assert delivered == ["barabot"]
-    assert reporter.keys() == []
+    assert recorded.keys() == []
 
 
 def test_invite_link_request_is_pending_then_assigned_by_title():
-    upstream, registry, reporter, gw = make()
+    upstream, registry, recorded, gw = make()
     upstream.on(functions.messages.CheckChatInviteRequest, lambda r: private_invite("Аренда Тбилиси"))
     upstream.on(functions.messages.ImportChatInviteRequest, lambda r: errors.InviteRequestSentError(r))
     with pytest.raises(errors.InviteRequestSentError):
@@ -328,7 +328,7 @@ def test_invite_link_request_is_pending_then_assigned_by_title():
 
 
 def test_ambiguous_titles_are_reported_not_guessed():
-    upstream, registry, reporter, gw = make()
+    upstream, registry, recorded, gw = make()
     upstream.on(functions.messages.CheckChatInviteRequest, lambda r: private_invite("Flats"))
     upstream.on(functions.messages.ImportChatInviteRequest, lambda r: errors.InviteRequestSentError(r))
     for name, link in (("barabot", "a"), ("lofi", "b")):
@@ -338,12 +338,12 @@ def test_ambiguous_titles_are_reported_not_guessed():
     run(upstream.push(update, entities))
     assert registry.owner(channel_id(7)) is None
     assert len(registry.pendings()) == 2
-    assert reporter.keys() == [f"pending-ambiguous:{channel_id(7)}"]
-    assert "tgmux grant" in reporter.reports[0][1]
+    assert recorded.keys() == [f"pending-ambiguous:{channel_id(7)}"]
+    assert "tgmux grant" in recorded.reports[0][1]
 
 
 def test_stale_requests_expire_with_a_report():
-    upstream, registry, reporter, gw = make()
+    upstream, registry, recorded, gw = make()
     wall = [1_000_000.0]
     gw._wall_clock = lambda: wall[0]
     gw._pending_ttl = 100
@@ -356,4 +356,4 @@ def test_stale_requests_expire_with_a_report():
     wall[0] += 100
     gw.sweep()
     assert registry.pendings() == []
-    assert any(k.startswith("pending-expired:") for k in reporter.keys())
+    assert any(k.startswith("pending-expired:") for k in recorded.keys())

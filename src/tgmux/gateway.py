@@ -33,7 +33,7 @@ from tgmux.peers import CallMap, channel_id, chat_id, referenced_ids, request_sc
 from tgmux.policy import DM_CLAIMING, GLOBAL_ALLOW, unwrap
 from tgmux.protocol import Frame
 from tgmux.registry import Registry
-from tgmux.reporter import LogReporter, Reporter
+from tgmux.events import EventLog, EventSink
 from tgmux.upstream import Upstream
 
 log = logging.getLogger(__name__)
@@ -102,7 +102,7 @@ class Gateway:
         self,
         upstream: Upstream,
         registry: Registry,
-        reporter: Reporter | None = None,
+        events: EventSink | None = None,
         *,
         global_allow: frozenset[type] = GLOBAL_ALLOW,
         backlog_limit: int = BACKLOG_LIMIT,
@@ -116,7 +116,7 @@ class Gateway:
         self.upstream = upstream
         self.auto_register = auto_register
         self.registry = registry
-        self.reporter: Reporter = reporter or LogReporter()
+        self.events: EventSink = events or EventLog()
         self.global_allow = global_allow
         self.calls = CallMap()
         self._connections: dict[str, _Connection] = {}
@@ -203,13 +203,13 @@ class Gateway:
         except (asyncio.IncompleteReadError, ConnectionError, asyncio.TimeoutError):
             pass
         except ProtocolError as exc:
-            self.reporter.report(f"protocol:{conn.name if conn else '?'}", f"Ошибка протокола: {exc}")
+            self.events.report(f"protocol:{conn.name if conn else '?'}", f"Ошибка протокола: {exc}")
         finally:
             for task in calls:
                 task.cancel()
             if conn is not None:
                 if conn.overflowed:
-                    self.reporter.report(f"overflow:{conn.name}", f"{conn.name} не успевал читать апдейты, соединение закрыто")
+                    self.events.report(f"overflow:{conn.name}", f"{conn.name} не успевал читать апдейты, соединение закрыто")
                 if self._connections.get(conn.name) is conn:
                     del self._connections[conn.name]
                     self._mark_offline(conn.name)
@@ -242,7 +242,7 @@ class Gateway:
                     return None
             else:
                 log.info("integration %s registered on first connect", name)
-                self.reporter.report(f"registered:{name}", f"🆕 новая интеграция {name} зарегистрирована при подключении", window=0)
+                self.events.report(f"registered:{name}", f"🆕 новая интеграция {name} зарегистрирована при подключении", window=0)
         return name, bool(hello.get("updates", True))
 
     async def _handle_call(self, conn: _Connection, payload: bytes) -> None:
@@ -258,7 +258,7 @@ class Gateway:
             conn.send(Frame.ERROR, protocol.encode_error(call_id, code, message))
         except ProtocolError as exc:
             conn.send(Frame.ERROR, protocol.encode_error(call_id, 400, "TGMUX_BAD_REQUEST"))
-            self.reporter.report(f"bad-request:{conn.name}", f"{conn.name}: не удалось разобрать запрос: {exc}")
+            self.events.report(f"bad-request:{conn.name}", f"{conn.name}: не удалось разобрать запрос: {exc}")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -266,7 +266,7 @@ class Gateway:
             conn.send(Frame.ERROR, protocol.encode_error(call_id, 400, "TGMUX_INTERNAL"))
             name = type(unwrap(request)).__name__ if request is not None else "?"
             log.exception("request %s from %s failed", name, conn.name)
-            self.reporter.report(
+            self.events.report(
                 f"call-error:{name}:{type(exc).__name__}",
                 f"{conn.name}: {name} упал с {type(exc).__name__}: {exc}\n{_short_traceback(exc)}",
             )
@@ -364,7 +364,7 @@ class Gateway:
             raise
         joined = [c for c in getattr(result, "chats", []) if isinstance(c, (types.Channel, types.Chat))]
         if not joined:
-            self.reporter.report(
+            self.events.report(
                 f"invite-no-chat:{integration}",
                 f"{integration}: ImportChatInvite прошёл, но в ответе нет чата ({type(result).__name__}); владелец не назначен",
             )
@@ -412,7 +412,7 @@ class Gateway:
             return None
         if len(matches) > 1:
             who = ", ".join(f"{p.integration} (#{p.id})" for p in matches)
-            self.reporter.report(
+            self.events.report(
                 f"pending-ambiguous:{chat}",
                 f"Чат «{title}» ({chat}) подходит к нескольким заявкам: {who}. Владелец не назначен: "
                 f"`tgmux grant {chat} <интеграция>` и `tgmux pending cancel <id>`",
@@ -428,7 +428,7 @@ class Gateway:
     def _claim(self, integration: str, chat: int, source: str, request) -> None:
         owner = self.registry.claim(chat, integration, source)
         if owner != integration:
-            self.reporter.report(
+            self.events.report(
                 f"claim-race:{chat}",
                 f"{integration} вошёл в чат {chat}, но им уже владеет {owner}; аккаунт остался в чате",
             )
@@ -458,7 +458,7 @@ class Gateway:
             try:
                 peers.append(types.InputDialogPeer(await self.upstream.input_peer(chat)))
             except (ValueError, TypeError):
-                self.reporter.report(f"dialog-no-entity:{chat}", f"Нет access_hash для чата {chat} ({integration}), он пропущен в списке диалогов")
+                self.events.report(f"dialog-no-entity:{chat}", f"Нет access_hash для чата {chat} ({integration}), он пропущен в списке диалогов")
         dialogs, messages, chats, users = [], [], [], []
         for i in range(0, len(peers), 100):
             part = await self.upstream.invoke(functions.messages.GetPeerDialogsRequest(peers[i:i + 100]))
@@ -475,7 +475,7 @@ class Gateway:
             self._route(update, entities)
         except Exception as exc:
             log.exception("failed to route %s", type(update).__name__)
-            self.reporter.report(
+            self.events.report(
                 f"route-error:{type(update).__name__}",
                 f"Не смог разослать {type(update).__name__}: {type(exc).__name__}: {exc}",
             )
@@ -489,12 +489,12 @@ class Gateway:
             if last and time.monotonic() - last[1] < CALL_CONNECTION_TTL:
                 self._deliver(last[0], update, entities, None)
             else:
-                self.reporter.report(f"no-peer:{update_name}", f"{update_name} без недавнего JoinGroupCall, отброшен")
+                self.events.report(f"no-peer:{update_name}", f"{update_name} без недавнего JoinGroupCall, отброшен")
             return
 
         chat = update_chat(update, calls=self.calls)
         if chat is None:
-            self.reporter.report(f"no-peer:{update_name}", f"Апдейт без чата отброшен: {update_name}")
+            self.events.report(f"no-peer:{update_name}", f"Апдейт без чата отброшен: {update_name}")
             return
 
         owner = self.registry.owner(chat)
@@ -502,7 +502,7 @@ class Gateway:
             owner = self._resolve_pending(chat, update, entities.get(chat))
         if owner is None:
             if isinstance(update, (types.UpdateNewMessage, types.UpdateNewChannelMessage)):
-                self.reporter.report(
+                self.events.report(
                     f"unowned:{chat}",
                     f"Сообщение в чате без владельца отброшено: {_title(entities.get(chat))} ({chat})",
                     window=UNOWNED_REPORT_WINDOW,
@@ -527,7 +527,7 @@ class Gateway:
             queue.popleft()
             outage.overflowed += 1
             if outage.overflowed == 1:
-                self.reporter.report(
+                self.events.report(
                     f"backlog-overflow:{owner}",
                     f"⚠️ {owner}: очередь переполнена ({self._backlog_limit} апдейтов), "
                     f"самые старые выбрасываются. Итог потерь придёт при переподключении.",
@@ -566,7 +566,7 @@ class Gateway:
         text = f"✅ {name} снова подключена после {_duration(self._clock() - outage.since)}; доставлено из очереди: {delivered}"
         if lost:
             text += f"\nпотеряно: {lost} (переполнение: {outage.overflowed}, старше {_duration(self._backlog_ttl)}: {outage.expired})"
-        self.reporter.report(f"online:{name}", text, window=0)
+        self.events.report(f"online:{name}", text, window=0)
 
     def sweep(self) -> None:
         """Report unavailable integrations and drop expired queued updates. Runs every few seconds."""
@@ -582,14 +582,14 @@ class Gateway:
                 first = outage.expired == 0
                 outage.expired += expired
                 if first:
-                    self.reporter.report(
+                    self.events.report(
                         f"backlog-expired:{name}",
                         f"⚠️ {name}: апдейты старше {_duration(self._backlog_ttl)} выбрасываются из очереди "
                         f"(уже {expired}). Итог потерь придёт при переподключении.",
                         window=0,
                     )
         for pending in self.registry.expire_pending(int(self._wall_clock() - self._pending_ttl)):
-            self.reporter.report(
+            self.events.report(
                 f"pending-expired:{pending.id}",
                 f"Заявка #{pending.id} от {pending.integration} на «{pending.title or pending.chat_id}» "
                 f"не одобрена за {_duration(self._pending_ttl)}, удалена",
@@ -604,7 +604,7 @@ class Gateway:
             if not outage.reported and offline_for >= self._offline_grace:
                 outage.reported = True
                 outage.reminded_at = now
-                self.reporter.report(
+                self.events.report(
                     f"offline:{name}",
                     f"🔴 {name} недоступна уже {_duration(offline_for)}; апдейты копятся в очереди "
                     f"(лимит {self._backlog_limit}, хранятся {_duration(self._backlog_ttl)})",
@@ -612,7 +612,7 @@ class Gateway:
                 )
             elif outage.reported and now - outage.reminded_at >= STILL_OFFLINE_REMINDER:
                 outage.reminded_at = now
-                self.reporter.report(
+                self.events.report(
                     f"offline:{name}",
                     f"🔴 {name} всё ещё недоступна ({_duration(offline_for)}); в очереди {self.backlog_size(name)}, "
                     f"потеряно {outage.overflowed + outage.expired}",
@@ -626,7 +626,7 @@ class Gateway:
                 self.sweep()
             except Exception as exc:
                 log.exception("availability sweep failed")
-                self.reporter.report("sweep-error", f"Сбой проверки доступности: {type(exc).__name__}: {exc}")
+                self.events.report("sweep-error", f"Сбой проверки доступности: {type(exc).__name__}: {exc}")
 
     def backlog_size(self, integration: str) -> int:
         return len(self._backlog.get(integration, ()))
