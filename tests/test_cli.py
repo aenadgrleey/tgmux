@@ -182,3 +182,26 @@ def test_pending_list_and_cancel(tmp_path, capsys):
     run(cfg, "pending", "cancel", str(pending.id))
     with pytest.raises(SystemExit, match="no pending"):
         run(cfg, "pending", "cancel", str(pending.id))
+
+
+def test_waiting_for_disconnect_accepts_telethon_future():
+    """Telethon exposes `disconnected` as a shielded Future; the fake used to return a coroutine."""
+    from telethon import TelegramClient
+    from telethon.sessions import MemorySession
+
+    async def scenario():
+        client = TelegramClient(MemorySession(), 1, "0" * 32)
+        assert asyncio.isfuture(client.disconnected)  # the real thing, not a coroutine
+        waiter = cli.when_disconnected(client)
+        await asyncio.wait_for(waiter, 1)  # not connected: resolves at once
+
+        class Coro:
+            @property
+            def disconnected(self):
+                async def done():
+                    return None
+                return done()
+
+        await asyncio.wait_for(cli.when_disconnected(Coro()), 1)
+
+    asyncio.run(scenario())

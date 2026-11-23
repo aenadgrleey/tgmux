@@ -49,6 +49,11 @@ def _label(cfg) -> str:
     return f"instance {cfg.instance} (pid {os.getpid()})"
 
 
+def when_disconnected(client) -> asyncio.Future:
+    """Telethon's `client.disconnected` is a Future (asyncio.shield), not a coroutine."""
+    return asyncio.ensure_future(client.disconnected)
+
+
 async def _serve(cfg: config_mod.Config) -> int:
     from telethon import TelegramClient
 
@@ -92,7 +97,7 @@ async def _serve(cfg: config_mod.Config) -> int:
         loop.add_signal_handler(sig, stop.set)
 
     stop_wait = loop.create_task(stop.wait())
-    upstream_lost = loop.create_task(upstream.client.disconnected)
+    upstream_lost = when_disconnected(upstream.client)
     reporter.report("lifecycle", "шлюз запущен", window=0)
     await asyncio.wait({stop_wait, upstream_lost}, return_when=asyncio.FIRST_COMPLETED)
     exit_code = 0
