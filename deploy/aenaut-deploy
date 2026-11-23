@@ -1,0 +1,22 @@
+#!/bin/sh
+# Each registered executable owns its Git fetch, activation, and health check.
+set -eu
+registry=/etc/aenaut-deploy/projects
+if [ "$#" -ne 1 ]; then
+    echo 'Usage: aenaut-deploy PROJECT | --list' >&2
+    exit 2
+fi
+case "$1" in
+    --list)
+        for hook in "$registry"/*; do
+            [ -f "$hook" ] && [ -x "$hook" ] && basename "$hook"
+        done
+        exit 0 ;;
+    ''|[!a-z0-9]*|*[!a-z0-9_-]*) echo 'Invalid project name' >&2; exit 2 ;;
+esac
+hook=$registry/$1
+if [ ! -f "$hook" ] || [ ! -x "$hook" ]; then
+    echo "Unknown deploy project: $1" >&2
+    exit 2
+fi
+exec "$hook"

@@ -203,6 +203,17 @@ Turn it off with `systemctl disable --now tgmux-deploy.timer`; logs are in
 `journalctl -u tgmux-deploy`. `tgmux-deploy` installs changed unit files from
 `deploy/` itself, timer included.
 
+On aenaut, `ssh aenaut aenaut-deploy tgmux` runs the same deploy on demand.
+Use `ssh aenaut aenaut-deploy --list` to list registered projects. Each project
+owns its fetch, release branch, validation and journald messages. The shared
+command runs once per invocation. To install it and register a project as root:
+
+```sh
+install -m 0755 /opt/tgmux/deploy/aenaut-deploy /usr/local/bin/aenaut-deploy
+install -d -m 0755 /etc/aenaut-deploy/projects
+ln -s /opt/tgmux/deploy/deploy.sh /etc/aenaut-deploy/projects/tgmux
+```
+
 Updates, on the server (`ssh` in first):
 
 ```bash

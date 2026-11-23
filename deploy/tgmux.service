@@ -1,7 +1,7 @@
 # tgmux gateway on a server (instance "default").
 #
 # Code:   /opt/tgmux (git work tree, venv in /opt/tgmux/.venv)
-# Config: /root/.config/tgmux/default/     config.toml, telegram.env, reporter.token
+# Config: /root/.config/tgmux/default/     config.toml, telegram.env
 # State:  /root/.local/state/tgmux/default/ telegram.session, tgmux.db, gateway.sock, locks/
 #
 # Install once:
