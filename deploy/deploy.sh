@@ -2,7 +2,7 @@
 # Deploy a git ref of tgmux to /opt/tgmux and restart the gateway.
 # Run on the server; installed as /usr/local/bin/tgmux-deploy.
 #
-#   tgmux-deploy                 deploy the latest origin/master
+#   tgmux-deploy                 deploy the latest origin/prod
 #   tgmux-deploy REF             deploy a tag or commit: checkout, install, validate, restart;
 #                                  roll back on failure; nothing happens if REF is already deployed
 #   tgmux-deploy --dry-run [REF] print what would happen
@@ -21,7 +21,7 @@ fi
 trap 'rm -f -- "$TGMUX_DEPLOY_COPY"' EXIT
 
 usage() {
-    printf 'Usage: tgmux-deploy [--check|--dry-run] [REF]   (REF defaults to origin/master)\n' >&2
+    printf 'Usage: tgmux-deploy [--check|--dry-run] [REF]   (REF defaults to origin/prod)\n' >&2
 }
 
 mode=activate
@@ -30,7 +30,7 @@ case "${1-}" in
     -h|--help) usage; exit 0 ;;
 esac
 [[ $# -le 1 ]] || { usage; exit 2; }
-ref=${1:-origin/master}
+ref=${1:-origin/prod}
 [[ $ref != -* ]] || { printf 'error: REF must not begin with a dash\n' >&2; exit 2; }
 
 root=/opt/tgmux
@@ -53,12 +53,18 @@ fi
 [[ -x $python ]] || { printf 'error: missing %s (python3 -m venv %s/.venv)\n' "$python" "$root" >&2; exit 1; }
 
 git_root=(git -C "$root")
-"${git_root[@]}" fetch --quiet --tags origin || printf 'warning: git fetch failed, using local refs\n' >&2
+"${git_root[@]}" fetch --quiet --prune --tags origin || printf 'warning: git fetch failed, using local refs\n' >&2
 target=$("${git_root[@]}" rev-parse --verify --end-of-options "${ref}^{commit}") || {
     printf 'error: REF does not resolve to a commit: %s\n' "$ref" >&2
     exit 1
 }
 old_ref=$("${git_root[@]}" rev-parse --verify HEAD)
+
+# Work lands on dev and is promoted with `git push origin dev:prod`; show what is still waiting.
+if [[ $ref == origin/prod ]] && waiting=$("${git_root[@]}" rev-list --count origin/prod..origin/dev 2>/dev/null) \
+        && (( waiting > 0 )); then
+    printf 'note: dev is %s commit(s) ahead of prod (promote: git push origin dev:prod)\n' "$waiting" >&2
+fi
 
 "${git_root[@]}" diff --quiet -- && "${git_root[@]}" diff --cached --quiet -- || {
     printf 'error: %s has local modifications\n' "$root" >&2

@@ -187,10 +187,18 @@ systemctl daemon-reload && systemctl enable --now tgmux
 journalctl -u tgmux -f
 ```
 
+Branches: `dev` is where work lands (the default branch), `prod` is what the
+server runs. Promote and deploy:
+
+```bash
+git push origin dev:prod     # fast-forward only: prod never gets ahead of dev
+ssh aenaut tgmux-deploy
+```
+
 Updates, on the server (`ssh` in first):
 
 ```bash
-tgmux-deploy                 # the latest origin/master
+tgmux-deploy                 # the latest origin/prod
 tgmux-deploy v0.1.1          # a tag or commit instead
 tgmux-deploy --dry-run       # what it would do
 ```
