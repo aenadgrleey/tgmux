@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Deploy a git ref of tgmux to /opt/tgmux and restart the prod gateway.
+# Run on the server; installed as /usr/local/bin/tgmux-deploy.
 #
-#   deploy/prod.sh                 deploy the latest origin/master
-#   deploy/prod.sh REF             deploy a tag or commit: checkout, install, validate, restart;
+#   tgmux-deploy                 deploy the latest origin/master
+#   tgmux-deploy REF             deploy a tag or commit: checkout, install, validate, restart;
 #                                  roll back on failure; nothing happens if REF is already deployed
-#   deploy/prod.sh --dry-run [REF] print what would happen
-#   deploy/prod.sh --check [REF]   validate the currently deployed commit without restarting
+#   tgmux-deploy --dry-run [REF] print what would happen
+#   tgmux-deploy --check [REF]   validate the currently deployed commit without restarting
 #
 # Validation is `tgmux serve --check`: offline, never opens a second Telegram
 # connection with the session the running gateway uses.

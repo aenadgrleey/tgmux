@@ -173,6 +173,7 @@ First install on the VPS (as root):
 git clone https://github.com/aenadgrleey/tgmux.git /opt/tgmux
 python3 -m venv /opt/tgmux/.venv && /opt/tgmux/.venv/bin/pip install -e /opt/tgmux
 ln -s /opt/tgmux/.venv/bin/tgmux /usr/local/bin/tgmux
+ln -s /opt/tgmux/deploy/prod.sh /usr/local/bin/tgmux-deploy
 export TGMUX_INSTANCE=prod
 
 tgmux telegram login                 # asks API_ID/API_HASH, phone, code, 2FA
@@ -185,20 +186,19 @@ systemctl daemon-reload && systemctl enable --now tgmux-prod
 journalctl -u tgmux-prod -f
 ```
 
-Updates, from the laptop:
+Updates, on the server (`ssh` in first):
 
 ```bash
-deploy/remote.sh             # push master, deploy the latest origin/master on aenaut
-deploy/remote.sh v0.1.1      # a tag or commit instead
-deploy/remote.sh --dry-run
+tgmux-deploy                 # the latest origin/master
+tgmux-deploy v0.1.1          # a tag or commit instead
+tgmux-deploy --dry-run       # what it would do
 ```
 
-It runs `/opt/tgmux/deploy/prod.sh [REF]` over ssh (host `$TGMUX_DEPLOY_HOST`,
-default `aenaut`). `prod.sh` fetches, checks out the ref, reinstalls, runs
-`serve --check`, restarts and requires the unit to stay up for 10 s; otherwise
-it restores the previous commit and restarts that. If the ref is already
-deployed and running, it does nothing. The server pulls from GitHub with a
-read-only deploy key (`Host github-tgmux` in `/root/.ssh/config`).
+`tgmux-deploy` is `/opt/tgmux/deploy/prod.sh`. It fetches from GitHub, checks
+out the ref, reinstalls, runs `serve --check`, restarts and requires the unit
+to stay up for 10 s; otherwise it restores the previous commit and restarts
+that. If the ref is already deployed and running, it does nothing. The server
+pulls with a read-only deploy key (`Host github-tgmux` in `/root/.ssh/config`).
 
 Integrations reach the gateway at `/root/.local/state/tgmux/prod/gateway.sock`
 (`TGMUX_INSTANCE=prod`). In their systemd unit that path must be writable
