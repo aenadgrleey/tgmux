@@ -288,6 +288,83 @@ def cmd_telegram_set(args) -> int:
     return 0
 
 
+_CODE_DELIVERY = {
+    "SentCodeTypeApp": "to the Telegram app on another device of this account (chat \"Telegram\")",
+    "SentCodeTypeSms": "by SMS",
+    "SentCodeTypeCall": "by a phone call (the code is dictated)",
+    "SentCodeTypeFlashCall": "by a flash call (the code is the last digits of the calling number)",
+    "SentCodeTypeMissedCall": "by a missed call (the code is the last digits of the calling number)",
+    "SentCodeTypeEmailCode": "by email",
+    "SentCodeTypeFragmentSms": "by SMS via fragment.com (anonymous number)",
+    "SentCodeTypeFirebaseSms": "by SMS",
+    "SentCodeTypeSmsWord": "by SMS (a word)",
+    "SentCodeTypeSmsPhrase": "by SMS (a phrase)",
+    "CodeTypeSms": "by SMS",
+    "CodeTypeCall": "by a phone call",
+    "CodeTypeFlashCall": "by a flash call",
+    "CodeTypeMissedCall": "by a missed call",
+    "CodeTypeFragmentSms": "by SMS via fragment.com",
+}
+
+
+def describe_sent_code(sent) -> str:
+    """Where Telegram sent the login code and what asking again would do."""
+    kind = type(sent.type).__name__
+    text = f"code sent {_CODE_DELIVERY.get(kind, kind)}"
+    if kind == "SentCodeTypeSetUpEmailRequired":
+        return "Telegram requires an email to be set up for this account first (log in from an official app once)"
+    if getattr(sent, "next_type", None) is not None:
+        later = _CODE_DELIVERY.get(type(sent.next_type).__name__, type(sent.next_type).__name__)
+        wait = f" after {sent.timeout} s" if getattr(sent, "timeout", None) else ""
+        text += f"; press Enter on an empty code to get it {later}{wait}"
+    else:
+        text += "; Telegram offers no other way to resend it"
+    return text
+
+
+async def _interactive_sign_in(client) -> None:
+    import getpass
+
+    from telethon import errors
+    from telethon.tl import functions
+
+    phone = input("Phone (international format, e.g. +79991234567): ").strip().replace(" ", "")
+    try:
+        sent = await client.send_code_request(phone)
+    except errors.PhoneNumberInvalidError:
+        raise SystemExit(f"Telegram says the phone number is invalid: {phone}")
+    except errors.FloodWaitError as exc:
+        raise SystemExit(f"too many attempts; Telegram asks to wait {exc.seconds} s")
+    print(describe_sent_code(sent))
+    while True:
+        code = input("Code: ").strip().replace(" ", "")
+        if not code:
+            try:
+                sent = await client(functions.auth.ResendCodeRequest(phone, sent.phone_code_hash))
+            except errors.SendCodeUnavailableError:
+                print("Telegram has no other way to send the code; wait and use the one already sent")
+                continue
+            except errors.FloodWaitError as exc:
+                print(f"Telegram asks to wait {exc.seconds} s before resending")
+                continue
+            except errors.RPCError as exc:
+                print(f"cannot resend: {exc}")
+                continue
+            print(describe_sent_code(sent))
+            continue
+        try:
+            await client.sign_in(phone, code, phone_code_hash=sent.phone_code_hash)
+            return
+        except errors.SessionPasswordNeededError:
+            await client.sign_in(password=getpass.getpass("2FA password (hidden): "))
+            return
+        except errors.PhoneCodeInvalidError:
+            print("wrong code, try again (empty = resend)")
+        except errors.PhoneCodeExpiredError:
+            sent = await client.send_code_request(phone)
+            print("the code expired; a new one was requested: " + describe_sent_code(sent))
+
+
 def cmd_telegram_login(args) -> int:
     """Interactive: phone, code from Telegram, 2FA password. Run it over ssh on the gateway host."""
     import getpass
@@ -325,9 +402,10 @@ def cmd_telegram_login(args) -> int:
         from telethon import TelegramClient
 
         client = TelegramClient(str(session), api_id, api_hash)
+        await client.connect()
         try:
-            # Telethon prompts for the phone, the code and (if set) the 2FA password.
-            await client.start()
+            if not await client.is_user_authorized():
+                await _interactive_sign_in(client)
             me = await client.get_me()
             return f"{me.first_name or ''} (id {me.id})".strip()
         finally:

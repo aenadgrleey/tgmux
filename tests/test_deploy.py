@@ -143,3 +143,14 @@ def test_created_directories_are_private(tmp_path):
     for d in ("root", "root/state", "root/state/default"):
         assert stat.S_IMODE((tmp_path / d).stat().st_mode) == 0o700, d
     assert config.private_dir(tmp_path / "root") == tmp_path / "root"  # existing: untouched
+
+
+def test_login_says_where_the_code_went():
+    from telethon.tl import types
+    from tgmux.cli import describe_sent_code
+
+    app = types.auth.SentCode(types.auth.SentCodeTypeApp(5), "h", next_type=types.auth.CodeTypeSms(), timeout=60)
+    text = describe_sent_code(app)
+    assert "Telegram app" in text and "by SMS after 60 s" in text
+    sms = types.auth.SentCode(types.auth.SentCodeTypeSms(5), "h")
+    assert "by SMS" in describe_sent_code(sms) and "no other way" in describe_sent_code(sms)
