@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy a git ref of tgmux to /opt/tgmux and restart the prod gateway.
+# Deploy a git ref of tgmux to /opt/tgmux and restart the gateway.
 # Run on the server; installed as /usr/local/bin/tgmux-deploy.
 #
 #   tgmux-deploy                 deploy the latest origin/master
@@ -14,14 +14,14 @@ set -Eeuo pipefail
 
 # The checkout below rewrites this very file; bash reads scripts lazily, so run from a copy.
 if [[ -z ${TGMUX_DEPLOY_COPY-} ]]; then
-    copy=$(mktemp "${TMPDIR:-/tmp}/tgmux-prod.XXXXXX")
+    copy=$(mktemp "${TMPDIR:-/tmp}/tgmux-deploy.XXXXXX")
     cp -- "$0" "$copy"
     TGMUX_DEPLOY_COPY=$copy exec bash "$copy" "$@"
 fi
 trap 'rm -f -- "$TGMUX_DEPLOY_COPY"' EXIT
 
 usage() {
-    printf 'Usage: prod.sh [--check|--dry-run] [REF]   (REF defaults to origin/master)\n' >&2
+    printf 'Usage: tgmux-deploy [--check|--dry-run] [REF]   (REF defaults to origin/master)\n' >&2
 }
 
 mode=activate
@@ -33,40 +33,40 @@ esac
 ref=${1:-origin/master}
 [[ $ref != -* ]] || { printf 'error: REF must not begin with a dash\n' >&2; exit 2; }
 
-prod_root=/opt/tgmux
-python="$prod_root/.venv/bin/python"
-tgmux="$prod_root/.venv/bin/tgmux"
+root=/opt/tgmux
+python="$root/.venv/bin/python"
+tgmux="$root/.venv/bin/tgmux"
 unit=tgmux.service
 unset TGMUX_INSTANCE   # the gateway runs the default instance
 settle=10   # seconds the gateway must stay up after a restart
 
 if [[ $mode == dry-run ]]; then
-    printf 'DRY RUN: git -C %q fetch, checkout --detach %q\n' "$prod_root" "$ref"
+    printf 'DRY RUN: git -C %q fetch, checkout --detach %q\n' "$root" "$ref"
     printf 'DRY RUN: %q -m pip install -e %q, then %q serve --check\n' \
-        "$python" "$prod_root" "$tgmux"
+        "$python" "$root" "$tgmux"
     printf 'DRY RUN: systemctl restart %q, require it active after %ss; on failure restore the previous commit\n' \
         "$unit" "$settle"
     exit 0
 fi
 
-[[ -d $prod_root/.git ]] || { printf 'error: %s is not a git work tree\n' "$prod_root" >&2; exit 1; }
-[[ -x $python ]] || { printf 'error: missing %s (python3 -m venv %s/.venv)\n' "$python" "$prod_root" >&2; exit 1; }
+[[ -d $root/.git ]] || { printf 'error: %s is not a git work tree\n' "$root" >&2; exit 1; }
+[[ -x $python ]] || { printf 'error: missing %s (python3 -m venv %s/.venv)\n' "$python" "$root" >&2; exit 1; }
 
-git_prod=(git -C "$prod_root")
-"${git_prod[@]}" fetch --quiet --tags origin || printf 'warning: git fetch failed, using local refs\n' >&2
-target=$("${git_prod[@]}" rev-parse --verify --end-of-options "${ref}^{commit}") || {
+git_root=(git -C "$root")
+"${git_root[@]}" fetch --quiet --tags origin || printf 'warning: git fetch failed, using local refs\n' >&2
+target=$("${git_root[@]}" rev-parse --verify --end-of-options "${ref}^{commit}") || {
     printf 'error: REF does not resolve to a commit: %s\n' "$ref" >&2
     exit 1
 }
-old_ref=$("${git_prod[@]}" rev-parse --verify HEAD)
+old_ref=$("${git_root[@]}" rev-parse --verify HEAD)
 
-"${git_prod[@]}" diff --quiet -- && "${git_prod[@]}" diff --cached --quiet -- || {
-    printf 'error: %s has local modifications\n' "$prod_root" >&2
+"${git_root[@]}" diff --quiet -- && "${git_root[@]}" diff --cached --quiet -- || {
+    printf 'error: %s has local modifications\n' "$root" >&2
     exit 1
 }
 
 install() {
-    "$python" -m pip install --quiet --disable-pip-version-check -e "$prod_root"
+    "$python" -m pip install --quiet --disable-pip-version-check -e "$root"
 }
 
 if [[ $mode == check ]]; then
@@ -85,10 +85,10 @@ if [[ $target == "$old_ref" ]] && systemctl is-active --quiet "$unit"; then
     exit 0
 fi
 printf 'deploying %s: %s -> %s\n' "$ref" "${old_ref:0:7}" "${target:0:7}"
-"${git_prod[@]}" log --oneline --no-decorate "$old_ref..$target" -- | sed 's/^/  /' || true
+"${git_root[@]}" log --oneline --no-decorate "$old_ref..$target" -- | sed 's/^/  /' || true
 
 restore() {
-    "${git_prod[@]}" checkout --detach --quiet "$old_ref"
+    "${git_root[@]}" checkout --detach --quiet "$old_ref"
     install
 }
 
@@ -98,7 +98,7 @@ started_ok() {
     systemctl is-active --quiet "$unit"
 }
 
-"${git_prod[@]}" checkout --detach --quiet "$target"
+"${git_root[@]}" checkout --detach --quiet "$target"
 if ! install || ! "$tgmux" serve --check; then
     printf 'error: candidate validation failed; restoring %s\n' "$old_ref" >&2
     restore

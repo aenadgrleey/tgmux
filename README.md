@@ -153,30 +153,23 @@ Other commands: `tgmux chats [integration]`, `tgmux grant <chat_id> <integration
 `tgmux release <chat_id>`, `tgmux integration list|remove`,
 `tgmux reporter show|test|disable`, `tgmux instances`.
 
-## Deploy: dev on the laptop, prod on the VPS
+## Deploy on a server
 
-An instance is a tgmux thing (one gateway = one Telegram account on one
-machine), not an environment. Dev and prod are machines; each runs its
-gateway in the `default` instance with its **own session** of the same
-account (own auth key, logged in separately), like a phone and a desktop:
+An instance is one gateway = one Telegram account on one machine. The laptop
+and the server each run their own gateway in the `default` instance, with
+their **own session** of the same account (logged in separately), like a
+phone and a desktop. Never copy a session file between machines: two live
+copies of one auth key make Telegram revoke it. Both gateways see every update
+of the account, so chats joined from the laptop show up on the server as
+"nobody owns this chat" reports (once a day per chat).
 
-| | where | how it runs |
-|---|---|---|
-| dev | laptop | `tgmux serve` by hand |
-| prod | VPS | systemd `tgmux.service`, code in `/opt/tgmux` |
-
-Never copy a session file between machines: two live copies of one auth key
-make Telegram revoke it. Both gateways see every update of the account, so
-chats the dev Barabot joins show up in prod as "nobody owns this chat"
-reports (once a day per chat).
-
-First install on the VPS (as root):
+First install on the server (as root):
 
 ```bash
 git clone https://github.com/aenadgrleey/tgmux.git /opt/tgmux
 python3 -m venv /opt/tgmux/.venv && /opt/tgmux/.venv/bin/pip install -e /opt/tgmux
 ln -s /opt/tgmux/.venv/bin/tgmux /usr/local/bin/tgmux
-ln -s /opt/tgmux/deploy/prod.sh /usr/local/bin/tgmux-deploy
+ln -s /opt/tgmux/deploy/deploy.sh /usr/local/bin/tgmux-deploy
 
 tgmux telegram login                 # asks API_ID/API_HASH, phone, code, 2FA
 tgmux integration add barabot
@@ -196,7 +189,7 @@ tgmux-deploy v0.1.1          # a tag or commit instead
 tgmux-deploy --dry-run       # what it would do
 ```
 
-`tgmux-deploy` is `/opt/tgmux/deploy/prod.sh`. It fetches from GitHub, checks
+`tgmux-deploy` is `/opt/tgmux/deploy/deploy.sh`. It fetches from GitHub, checks
 out the ref, reinstalls, runs `serve --check`, restarts and requires the unit
 to stay up for 10 s; otherwise it restores the previous commit and restarts
 that. If the ref is already deployed and running, it does nothing. The server

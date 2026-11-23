@@ -1,4 +1,4 @@
-# tgmux gateway on the VPS (instance "default").
+# tgmux gateway on a server (instance "default").
 #
 # Code:   /opt/tgmux (git work tree, venv in /opt/tgmux/.venv)
 # Config: /root/.config/tgmux/default/     config.toml, telegram.env, reporter.token
