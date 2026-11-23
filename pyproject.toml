@@ -9,7 +9,7 @@ description = "Share one Telegram user account between several services, with pe
 requires-python = ">=3.11"
 # Telethon internals (_sender, _call, _dispatch_update) are used on purpose.
 # Bump only together with the tests in tests/test_end_to_end.py.
-dependencies = ["telethon==1.46.0"]
+dependencies = ["telethon==1.46.0", "qrcode>=7"]  # qrcode: `tgmux telegram login --qr`
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

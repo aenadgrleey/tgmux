@@ -154,3 +154,11 @@ def test_login_says_where_the_code_went():
     assert "Telegram app" in text and "by SMS after 60 s" in text
     sms = types.auth.SentCode(types.auth.SentCodeTypeSms(5), "h")
     assert "by SMS" in describe_sent_code(sms) and "no other way" in describe_sent_code(sms)
+
+
+def test_qr_renders(capsys):
+    from tgmux.cli import print_qr
+
+    print_qr("tg://login?token=abc")
+    out = capsys.readouterr().out
+    assert len(out.splitlines()) > 10

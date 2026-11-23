@@ -172,6 +172,7 @@ ln -s /opt/tgmux/.venv/bin/tgmux /usr/local/bin/tgmux
 ln -s /opt/tgmux/deploy/deploy.sh /usr/local/bin/tgmux-deploy
 
 tgmux telegram login                 # asks API_ID/API_HASH, phone, code, 2FA
+#   or: tgmux telegram login --qr   # scan with the phone where the account is open; no code
 tgmux integration add barabot
 tgmux reporter set --chat-id 123456789 --token-file /root/.config/tgmux/default/reporter.token
 tgmux serve --check                  # offline: config, session, credentials, registry

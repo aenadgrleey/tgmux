@@ -365,6 +365,37 @@ async def _interactive_sign_in(client) -> None:
             print("the code expired; a new one was requested: " + describe_sent_code(sent))
 
 
+def print_qr(url: str) -> None:
+    import qrcode
+
+    qr = qrcode.QRCode(border=2)
+    qr.add_data(url)
+    qr.print_ascii(tty=False, invert=True)
+
+
+async def _qr_sign_in(client) -> None:
+    """Log in by scanning a QR with a phone where this account is already open; no code needed."""
+    import datetime
+    import getpass
+
+    from telethon import errors
+
+    qr_login = await client.qr_login()
+    while True:
+        print_qr(qr_login.url)
+        left = int((qr_login.expires - datetime.datetime.now(datetime.timezone.utc)).total_seconds())
+        print("On the phone with this account: Settings > Devices > Link Desktop Device, scan the code.")
+        print(f"It expires in {left} s; a new one is printed then. Ctrl+C to stop.")
+        try:
+            await qr_login.wait()
+            return
+        except asyncio.TimeoutError:
+            await qr_login.recreate()
+        except errors.SessionPasswordNeededError:
+            await client.sign_in(password=getpass.getpass("2FA password (hidden): "))
+            return
+
+
 def cmd_telegram_login(args) -> int:
     """Interactive: phone, code from Telegram, 2FA password. Run it over ssh on the gateway host."""
     import getpass
@@ -405,7 +436,7 @@ def cmd_telegram_login(args) -> int:
         await client.connect()
         try:
             if not await client.is_user_authorized():
-                await _interactive_sign_in(client)
+                await (_qr_sign_in(client) if args.qr else _interactive_sign_in(client))
             me = await client.get_me()
             return f"{me.first_name or ''} (id {me.id})".strip()
         finally:
@@ -556,6 +587,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="env file with API_ID and API_HASH (default: from config, else asked and saved)")
     tlogin.add_argument("--session", type=Path,
                         help="where to store the session (default: <state>/<instance>/telegram.session)")
+    tlogin.add_argument("--qr", action="store_true",
+                        help="log in by scanning a QR code with a phone where the account is open (no code)")
     tlogin.set_defaults(func=cmd_telegram_login)
     return parser
 
