@@ -156,7 +156,7 @@ chat_id    = 123456789          # required whenever token_file is set
 
 Other commands: `tgmux chats [integration]`, `tgmux grant <chat_id> <integration>`,
 `tgmux release <chat_id>`, `tgmux integration list|remove`,
-`tgmux reporter show|test|disable`, `tgmux instances`.
+`tgmux reporter show|test|send|disable`, `tgmux instances`.
 
 ## Deploy on a server
 
@@ -182,18 +182,26 @@ tgmux integration add barabot
 tgmux reporter set --chat-id 123456789 --token-file /root/.config/tgmux/default/reporter.token
 tgmux serve --check                  # offline: config, session, credentials, registry
 
-cp /opt/tgmux/deploy/tgmux.service /etc/systemd/system/
-systemctl daemon-reload && systemctl enable --now tgmux
+cp /opt/tgmux/deploy/tgmux.service /opt/tgmux/deploy/tgmux-deploy.{service,timer} /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now tgmux tgmux-deploy.timer
 journalctl -u tgmux -f
 ```
 
 Branches: `dev` is where work lands (the default branch), `prod` is what the
-server runs. Promote and deploy:
+server runs. **A push to `prod` deploys itself** within about a minute:
 
 ```bash
 git push origin dev:prod     # fast-forward only: prod never gets ahead of dev
-ssh aenaut tgmux-deploy
 ```
+
+`tgmux-deploy.timer` runs `tgmux-deploy --auto` every minute: it fetches, and
+if `origin/prod` moved it deploys it (same steps as below). The reporter bot
+says "🚀 deployed" or "❌ failed, rolled back". A commit that failed is not
+retried until `prod` moves again; the timer never starts a gateway you
+stopped on purpose; a manual `tgmux-deploy` waits for a running auto-deploy.
+Turn it off with `systemctl disable --now tgmux-deploy.timer`; logs are in
+`journalctl -u tgmux-deploy`. `tgmux-deploy` installs changed unit files from
+`deploy/` itself, timer included.
 
 Updates, on the server (`ssh` in first):
 

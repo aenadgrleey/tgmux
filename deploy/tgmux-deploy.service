@@ -1,0 +1,11 @@
+# Deploy origin/prod if it moved (run by tgmux-deploy.timer).
+# Installed and kept up to date by tgmux-deploy itself; logs: journalctl -u tgmux-deploy
+[Unit]
+Description=tgmux: deploy origin/prod if it changed
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/tgmux/deploy/deploy.sh --auto
+TimeoutStartSec=10min

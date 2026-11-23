@@ -525,6 +525,24 @@ def cmd_reporter_test(args) -> int:
     return 0
 
 
+def cmd_reporter_send(args) -> int:
+    """Send a free-form message to the reporter's recipient (used by tgmux-deploy)."""
+    from tgmux.reporter import BotApiError, send_bot_message
+
+    cfg = _load(args)
+    if cfg.reporter is None:
+        print("reporter is not configured; message not sent", file=sys.stderr)
+        return 1
+    text = " ".join(args.text) if args.text else sys.stdin.read()
+    if not text.strip():
+        raise SystemExit("empty message")
+    try:
+        send_bot_message(cfg.reporter.token(), cfg.reporter.chat_id, f"tgmux[{cfg.instance}]: {text.strip()}")
+    except (BotApiError, OSError) as exc:
+        raise SystemExit(f"cannot send: {exc}")
+    return 0
+
+
 # --- entry point -------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -581,6 +599,9 @@ def build_parser() -> argparse.ArgumentParser:
     reporter.add_parser("disable", help="remove the service bot settings").set_defaults(func=cmd_reporter_disable)
     reporter.add_parser("show", help="print the reporter settings").set_defaults(func=cmd_reporter_show)
     reporter.add_parser("test", help="send a test report").set_defaults(func=cmd_reporter_test)
+    rsend = reporter.add_parser("send", help="send a message to the reporter's recipient (text or stdin)")
+    rsend.add_argument("text", nargs="*")
+    rsend.set_defaults(func=cmd_reporter_send)
 
     telegram = sub.add_parser("telegram", help="Telegram session settings").add_subparsers(dest="action", required=True)
     tset = telegram.add_parser("set", help="point the gateway at an authorized Telethon session")

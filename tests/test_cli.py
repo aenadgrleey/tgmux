@@ -205,3 +205,18 @@ def test_waiting_for_disconnect_accepts_telethon_future():
         await asyncio.wait_for(cli.when_disconnected(Coro()), 1)
 
     asyncio.run(scenario())
+
+
+def test_reporter_send_prefixes_instance(cfg_path, tmp_path, monkeypatch, capsys):
+    token = tmp_path / "bot.token"
+    token.write_text("1:x")
+    run(cfg_path, "reporter", "set", "--chat-id", "7", "--token-file", str(token), "--no-verify")
+    sent = []
+    monkeypatch.setattr(reporter_mod, "send_bot_message", lambda token, chat, text: sent.append((chat, text)))
+    assert run(cfg_path, "reporter", "send", "deployed", "abc") == 0
+    assert sent == [(7, "tgmux[default]: deployed abc")]
+
+
+def test_reporter_send_without_reporter_fails_softly(cfg_path, capsys):
+    assert run(cfg_path, "reporter", "send", "hi") == 1
+    assert "not configured" in capsys.readouterr().err

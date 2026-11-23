@@ -1,0 +1,13 @@
+# Checks the prod branch every minute; a push to prod is live within about a minute.
+#   systemctl list-timers tgmux-deploy        when it runs next
+#   systemctl disable --now tgmux-deploy.timer   turn auto-deploy off
+[Unit]
+Description=tgmux: check the prod branch every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
