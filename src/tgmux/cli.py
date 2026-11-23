@@ -30,7 +30,7 @@ class LockBusy(RuntimeError):
 
 def hold_lock(path: Path, label: str):
     """Take an flock and write ``label`` into the file; raise LockBusy with the holder's label."""
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    config_mod.private_dir(path.parent)
     handle = os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -315,7 +315,7 @@ def cmd_telegram_login(args) -> int:
         raise SystemExit(f"not found: {credentials}")
     session = (args.session.expanduser().resolve() if args.session
                else cfg.session or cfg.state_dir / "telegram.session")
-    session.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    config_mod.private_dir(session.parent)
 
     # Validate credentials and write [telegram] before talking to Telegram.
     config_mod.update(path, "telegram", {"session": str(session), "credentials": str(credentials)}, args.instance)

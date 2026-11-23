@@ -53,7 +53,7 @@ class IntegrationLock:
     def acquire(self) -> None:
         if self._fd is not None:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        config_mod.private_dir(self.path.parent)
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

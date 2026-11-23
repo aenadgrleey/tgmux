@@ -1,16 +1,26 @@
 #!/usr/bin/env bash
 # Deploy a git ref of tgmux to /opt/tgmux and restart the prod gateway.
 #
-#   deploy/prod.sh --dry-run REF   print what would happen
-#   deploy/prod.sh --check REF     validate the currently deployed REF without restarting
-#   deploy/prod.sh REF             checkout REF, install, validate, restart; roll back on failure
+#   deploy/prod.sh                 deploy the latest origin/master
+#   deploy/prod.sh REF             deploy a tag or commit: checkout, install, validate, restart;
+#                                  roll back on failure; nothing happens if REF is already deployed
+#   deploy/prod.sh --dry-run [REF] print what would happen
+#   deploy/prod.sh --check [REF]   validate the currently deployed commit without restarting
 #
 # Validation is `tgmux serve --check`: offline, never opens a second Telegram
 # connection with the session the running gateway uses.
 set -Eeuo pipefail
 
+# The checkout below rewrites this very file; bash reads scripts lazily, so run from a copy.
+if [[ -z ${TGMUX_DEPLOY_COPY-} ]]; then
+    copy=$(mktemp "${TMPDIR:-/tmp}/tgmux-prod.XXXXXX")
+    cp -- "$0" "$copy"
+    TGMUX_DEPLOY_COPY=$copy exec bash "$copy" "$@"
+fi
+trap 'rm -f -- "$TGMUX_DEPLOY_COPY"' EXIT
+
 usage() {
-    printf 'Usage: %s [--check|--dry-run] REF\n' "${0##*/}" >&2
+    printf 'Usage: prod.sh [--check|--dry-run] [REF]   (REF defaults to origin/master)\n' >&2
 }
 
 mode=activate
@@ -18,8 +28,8 @@ case "${1-}" in
     --check|--dry-run) mode=${1#--}; shift ;;
     -h|--help) usage; exit 0 ;;
 esac
-[[ $# -eq 1 ]] || { usage; exit 2; }
-ref=$1
+[[ $# -le 1 ]] || { usage; exit 2; }
+ref=${1:-origin/master}
 [[ $ref != -* ]] || { printf 'error: REF must not begin with a dash\n' >&2; exit 2; }
 
 prod_root=/opt/tgmux
@@ -59,7 +69,7 @@ install() {
 }
 
 if [[ $mode == check ]]; then
-    [[ $target == "$old_ref" ]] || {
+    [[ $# -eq 0 || $target == "$old_ref" ]] || {
         printf 'error: --check REF must be the deployed commit (%s)\n' "$old_ref" >&2
         exit 1
     }
@@ -68,6 +78,13 @@ if [[ $mode == check ]]; then
 fi
 
 (( EUID == 0 )) || { printf 'error: activation must run as root\n' >&2; exit 1; }
+
+if [[ $target == "$old_ref" ]] && systemctl is-active --quiet "$unit"; then
+    printf '%s is already at %s (%s) and running; nothing to do\n' "$unit" "${target:0:7}" "$ref"
+    exit 0
+fi
+printf 'deploying %s: %s -> %s\n' "$ref" "${old_ref:0:7}" "${target:0:7}"
+"${git_prod[@]}" log --oneline --no-decorate "$old_ref..$target" -- | sed 's/^/  /' || true
 
 restore() {
     "${git_prod[@]}" checkout --detach --quiet "$old_ref"

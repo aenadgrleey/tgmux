@@ -12,6 +12,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from tgmux import config as config_mod
+
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 
 _SCHEMA = """
@@ -73,7 +75,7 @@ class UnknownIntegrationError(KeyError):
 class Registry:
     def __init__(self, path: str | Path = ":memory:") -> None:
         if path != ":memory:":
-            Path(path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            config_mod.private_dir(Path(path).parent)
             Path(path).touch(mode=0o600, exist_ok=True)
         self._db = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
         self._db.execute("PRAGMA foreign_keys = ON")

@@ -185,9 +185,20 @@ systemctl daemon-reload && systemctl enable --now tgmux-prod
 journalctl -u tgmux-prod -f
 ```
 
-Updates: `/opt/tgmux/deploy/prod.sh v0.1.1` fetches, checks out the ref,
-reinstalls, runs `serve --check`, restarts and requires the unit to stay up for
-10 s; otherwise it restores the previous commit and restarts that.
+Updates, from the laptop:
+
+```bash
+deploy/remote.sh             # push master, deploy the latest origin/master on aenaut
+deploy/remote.sh v0.1.1      # a tag or commit instead
+deploy/remote.sh --dry-run
+```
+
+It runs `/opt/tgmux/deploy/prod.sh [REF]` over ssh (host `$TGMUX_DEPLOY_HOST`,
+default `aenaut`). `prod.sh` fetches, checks out the ref, reinstalls, runs
+`serve --check`, restarts and requires the unit to stay up for 10 s; otherwise
+it restores the previous commit and restarts that. If the ref is already
+deployed and running, it does nothing. The server pulls from GitHub with a
+read-only deploy key (`Host github-tgmux` in `/root/.ssh/config`).
 
 Integrations reach the gateway at `/root/.local/state/tgmux/prod/gateway.sock`
 (`TGMUX_INSTANCE=prod`). In their systemd unit that path must be writable

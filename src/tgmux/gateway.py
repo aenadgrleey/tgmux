@@ -20,6 +20,7 @@ from telethon.errors import RPCError
 from telethon.tl import functions, types
 from telethon.tl.tlobject import TLObject
 
+from tgmux import config as config_mod
 from tgmux import protocol
 from tgmux.errors import (
     CallNotResolvedError,
@@ -135,7 +136,7 @@ class Gateway:
 
     async def serve(self, socket_path: str | Path) -> asyncio.AbstractServer:
         path = Path(socket_path)
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        config_mod.private_dir(path.parent)
         if path.exists():
             path.unlink()
         old_umask = os.umask(0o177)  # socket is created 0600 directly, no chmod race

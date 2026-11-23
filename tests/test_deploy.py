@@ -132,3 +132,14 @@ def test_explicit_retry_limit_still_gives_up():
         raise AssertionError("connect() should fail after 2 retries")
 
     asyncio.run(scenario())
+
+
+def test_created_directories_are_private(tmp_path):
+    import stat
+    from tgmux import config
+    from tgmux.registry import Registry
+
+    Registry(tmp_path / "root" / "state" / "prod" / "tgmux.db")
+    for d in ("root", "root/state", "root/state/prod"):
+        assert stat.S_IMODE((tmp_path / d).stat().st_mode) == 0o700, d
+    assert config.private_dir(tmp_path / "root") == tmp_path / "root"  # existing: untouched

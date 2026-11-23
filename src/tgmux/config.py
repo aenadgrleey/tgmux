@@ -184,9 +184,26 @@ def dump(data: dict) -> str:
     return "\n".join(lines).lstrip("\n") + "\n"
 
 
+def private_dir(path: str | Path) -> Path:
+    """mkdir -p where every directory we create is 0700 (mkdir's mode= covers only the last one)."""
+    path = Path(path)
+    missing = []
+    while not path.exists():
+        missing.append(path)
+        if path.parent == path:
+            break
+        path = path.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+    return Path(missing[0]) if missing else path
+
+
 def write_private(path: Path, content: str) -> None:
     """Atomically write a 0600 file (config, token)."""
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    private_dir(path.parent)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         os.fchmod(fd, 0o600)
