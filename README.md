@@ -6,7 +6,7 @@ belongs to exactly one integration; an integration sees and touches only its cha
 ```
 Telegram ◄──► tgmux gateway (the only process holding the session)
                   ▲ unix socket, raw TL
-       SharedClient("barabot", instance="default")   SharedClient("lofi", instance="default")
+       SharedClient("barabot")   SharedClient("lofi")
 ```
 
 Integrations use `SharedClient`, a drop-in Telethon `TelegramClient`:
@@ -14,7 +14,7 @@ Integrations use `SharedClient`, a drop-in Telethon `TelegramClient`:
 ```python
 from tgmux import SharedClient
 
-client = SharedClient("barabot", instance="default")  # instead of TelegramClient(session, api_id, api_hash)
+client = SharedClient("barabot")                 # instead of TelegramClient(session, api_id, api_hash)
 await client.start()
 
 @client.on(events.NewMessage)                     # only updates from chats barabot owns
@@ -51,16 +51,16 @@ not share anything (config, registry, socket, locks, reports):
 Every command takes `--instance NAME` (or `$TGMUX_INSTANCE`, default `default`);
 anything run without one goes to `default`, which always exists;
 `tgmux instances` lists them and shows which are running. Integrations pick
-the account explicitly, always (no environment variables, no implicit default):
+the account in code; environment variables are not read:
 
 ```python
-SharedClient("barabot", instance="default")      # the default instance's gateway
+SharedClient("barabot")                          # instance "default"
 SharedClient("barabot", instance="second")       # another account
 SharedClient("barabot", socket_path="/x.sock")   # or a socket path instead
 ```
 
 The same integration name can be connected to several instances at once.
-Passing neither or both is a `TypeError`.
+Passing both `instance=` and `socket_path=` is a `TypeError`.
 
 A gateway refuses to start if its instance is already running, if another
 instance serves the same session file (Telegram would revoke the auth key), or
@@ -202,7 +202,7 @@ that. If the ref is already deployed and running, it does nothing. The server
 pulls with a read-only deploy key (`Host github-tgmux` in `/root/.ssh/config`).
 
 Integrations reach the gateway at `/root/.local/state/tgmux/default/gateway.sock`
-(`instance="default"`). In their systemd unit that path must be writable
+(`SharedClient("barabot")`). In their systemd unit that path must be writable
 (`ProtectHome=read-only` + `ReadWritePaths=/root/.local/state/tgmux/default`;
 `ProtectHome=true` hides it). `SharedClient` waits for the gateway forever
 with backoff up to 30 s, so integrations survive gateway restarts and may
