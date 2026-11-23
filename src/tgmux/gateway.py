@@ -111,8 +111,10 @@ class Gateway:
         pending_ttl: float = PENDING_TTL,
         clock=time.monotonic,
         wall_clock=time.time,
+        auto_register: bool = True,
     ) -> None:
         self.upstream = upstream
+        self.auto_register = auto_register
         self.registry = registry
         self.reporter: Reporter = reporter or LogReporter()
         self.global_allow = global_allow
@@ -225,9 +227,22 @@ class Gateway:
             version = hello.get("version")
         except (ValueError, KeyError, TypeError):
             return None
-        if version != protocol.PROTOCOL_VERSION or not self.registry.has_integration(name):
-            log.warning("rejected connection for integration %r", name)
+        if version != protocol.PROTOCOL_VERSION:
+            log.warning("rejected connection for integration %r: protocol %r", name, version)
             return None
+        if not self.registry.has_integration(name):
+            if not self.auto_register:
+                log.warning("rejected connection for unregistered integration %r", name)
+                return None
+            try:
+                self.registry.add_integration(name)
+            except ValueError as exc:  # invalid name (or registered concurrently)
+                if not self.registry.has_integration(name):
+                    log.warning("rejected connection for integration %r: %s", name, exc)
+                    return None
+            else:
+                log.info("integration %s registered on first connect", name)
+                self.reporter.report(f"registered:{name}", f"🆕 новая интеграция {name} зарегистрирована при подключении", window=0)
         return name, bool(hello.get("updates", True))
 
     async def _handle_call(self, conn: _Connection, payload: bytes) -> None:

@@ -11,6 +11,7 @@ Anything run without an instance goes to ``default``, which always exists:
 ``--config`` / ``TGMUX_CONFIG`` point at a config file directly. Example::
 
     socket = "~/.local/state/tgmux/gateway.sock"
+    auto_register = true   # default: an unknown integration name is registered on first connect
     db     = "~/.local/state/tgmux/tgmux.db"
 
     [telegram]
@@ -102,6 +103,7 @@ class Config:
     session: Path | None
     credentials: Path | None
     reporter: Reporter | None
+    auto_register: bool = True
 
     @property
     def lock_file(self) -> Path:
@@ -114,6 +116,12 @@ def _path(value: Any) -> Path | None:
     if not isinstance(value, str) or not value:
         raise ConfigError(f"expected a path string, got {value!r}")
     return Path(value).expanduser()
+
+
+def _bool(value: Any, key: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{key} must be true or false, got {value!r}")
+    return value
 
 
 def _reporter(section: dict) -> Reporter | None:
@@ -151,6 +159,7 @@ def parse(path: Path, data: dict, instance: str) -> Config:
         session=_path(telegram.get("session")),
         credentials=_path(telegram.get("credentials")),
         reporter=_reporter(data.get("reporter", {})),
+        auto_register=_bool(data.get("auto_register", True), "auto_register"),
     )
 
 

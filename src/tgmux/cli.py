@@ -81,7 +81,7 @@ async def _serve(cfg: config_mod.Config) -> int:
     # from the update state saved in the session; the gateway backlog holds it until
     # integrations reconnect.
     upstream = TelethonUpstream(TelegramClient(str(cfg.session), api_id, api_hash, catch_up=True))
-    gateway = Gateway(upstream, registry, reporter)  # installs the update handler before start()
+    gateway = Gateway(upstream, registry, reporter, auto_register=cfg.auto_register)  # installs the update handler before start()
     await upstream.start()
     # Two gateways on one account (different session files) would both route every update.
     try:
@@ -158,8 +158,8 @@ def check(cfg: config_mod.Config) -> list[str]:
             problems.append(f"reporter: {exc}")
     try:
         registry = _registry(cfg)
-        if not registry.integrations():
-            problems.append("no integrations registered; run `tgmux integration add NAME`")
+        if not registry.integrations() and not cfg.auto_register:
+            problems.append("no integrations registered and auto_register = false; run `tgmux integration add NAME`")
     except Exception as exc:  # unreadable or corrupt DB
         problems.append(f"registry {cfg.db}: {exc}")
     for directory in {cfg.state_dir, cfg.socket.parent}:

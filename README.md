@@ -6,7 +6,7 @@ belongs to exactly one integration; an integration sees and touches only its cha
 ```
 Telegram ◄──► tgmux gateway (the only process holding the session)
                   ▲ unix socket, raw TL
-       SharedClient("barabot")   SharedClient("lofi")
+       SharedClient("barabot", instance="default")   SharedClient("lofi", instance="default")
 ```
 
 Integrations use `SharedClient`, a drop-in Telethon `TelegramClient`:
@@ -14,7 +14,7 @@ Integrations use `SharedClient`, a drop-in Telethon `TelegramClient`:
 ```python
 from tgmux import SharedClient
 
-client = SharedClient("barabot")                 # instead of TelegramClient(session, api_id, api_hash)
+client = SharedClient("barabot", instance="default")  # instead of TelegramClient(session, api_id, api_hash)
 await client.start()
 
 @client.on(events.NewMessage)                     # only updates from chats barabot owns
@@ -25,9 +25,13 @@ await client(JoinChannelRequest("@flats"))        # free chat -> now owned by ba
 
 One process per integration: `SharedClient` holds an `flock` on
 `<socket dir>/locks/<integration>.lock` while connected; a second process gets
-`IntegrationInUseError` with the holder's pid. The gateway only accepts names
-registered with `tgmux integration add`. There are no tokens: on one machine the
-security boundary is the socket's 0600 permissions (same OS user).
+`IntegrationInUseError` with the holder's pid. There are no tokens: on one
+machine the security boundary is the socket's 0600 permissions (same OS user).
+
+Registration: an unknown name is registered on its first connect (the service
+bot reports "new integration"). `tgmux integration add NAME` registers ahead of
+time, so updates of its chats are queued even before it ever connects. With
+`auto_register = false` in config.toml only pre-registered names may connect.
 
 Only Telethon's transport (`_sender`) is replaced; `_call`, retries, flood
 waits, events and the entity cache are stock Telethon. Telethon is pinned
@@ -47,15 +51,16 @@ not share anything (config, registry, socket, locks, reports):
 Every command takes `--instance NAME` (or `$TGMUX_INSTANCE`, default `default`);
 anything run without one goes to `default`, which always exists;
 `tgmux instances` lists them and shows which are running. Integrations pick
-the account the same way:
+the account explicitly, always (no environment variables, no implicit default):
 
 ```python
-SharedClient("barabot")                      # $TGMUX_INSTANCE, else "default"
-SharedClient("barabot", instance="second")   # another account
+SharedClient("barabot", instance="default")      # the default instance's gateway
+SharedClient("barabot", instance="second")       # another account
+SharedClient("barabot", socket_path="/x.sock")   # or a socket path instead
 ```
 
 The same integration name can be connected to several instances at once.
-Socket lookup order: `socket_path=` > `instance=` > `$TGMUX_SOCKET` > `$TGMUX_INSTANCE`.
+Passing neither or both is a `TypeError`.
 
 A gateway refuses to start if its instance is already running, if another
 instance serves the same session file (Telegram would revoke the auth key), or
@@ -197,7 +202,7 @@ that. If the ref is already deployed and running, it does nothing. The server
 pulls with a read-only deploy key (`Host github-tgmux` in `/root/.ssh/config`).
 
 Integrations reach the gateway at `/root/.local/state/tgmux/default/gateway.sock`
-(no `TGMUX_INSTANCE` needed). In their systemd unit that path must be writable
+(`instance="default"`). In their systemd unit that path must be writable
 (`ProtectHome=read-only` + `ReadWritePaths=/root/.local/state/tgmux/default`;
 `ProtectHome=true` hides it). `SharedClient` waits for the gateway forever
 with backoff up to 30 s, so integrations survive gateway restarts and may

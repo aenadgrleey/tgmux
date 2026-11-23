@@ -112,9 +112,9 @@ def test_entities_from_updates_are_cached_for_replies():
     asyncio.run(scenario())
 
 
-def test_unknown_integration_is_rejected():
+def test_unknown_integration_is_rejected_without_auto_register():
     async def scenario():
-        *_, server, sock = await start_gateway()
+        *_, server, sock = await start_gateway(auto_register=False)
         client = SharedClient("ghost", socket_path=sock)
         try:
             with pytest.raises(GatewayRejectedError):
@@ -122,6 +122,43 @@ def test_unknown_integration_is_rejected():
             # a refused connect must not leave the lock behind
             assert _lock_is_free(sock.parent / "locks" / "ghost.lock")
         finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_unknown_integration_registers_itself_on_connect():
+    async def scenario():
+        _, registry, reporter, gateway, server, sock = await start_gateway()
+        client = SharedClient("newbie", socket_path=sock)
+        try:
+            await client.connect()
+            assert registry.has_integration("newbie")
+            assert gateway.connected() == ["newbie"]
+            assert "registered:newbie" in reporter.keys()
+            await client.disconnect()
+            await client.connect()  # second time: already registered, no new report
+            assert reporter.keys().count("registered:newbie") == 1
+        finally:
+            await client.disconnect()
+            await gateway.close()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_invalid_integration_name_is_still_rejected():
+    async def scenario():
+        _, registry, _, gateway, server, sock = await start_gateway()
+        client = SharedClient("Bad Name", socket_path=sock)
+        try:
+            with pytest.raises(GatewayRejectedError):
+                await client.connect()
+            assert not registry.has_integration("Bad Name")
+        finally:
+            await gateway.close()
             server.close()
             await server.wait_closed()
 

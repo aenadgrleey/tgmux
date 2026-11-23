@@ -42,6 +42,7 @@ def test_check_passes_for_a_complete_instance(tmp_path, capsys):
 
 def test_check_lists_every_problem(tmp_path, capsys):
     cfg = _config(tmp_path, _session(tmp_path / "a.session", None))
+    cfg.write_text("auto_register = false\n" + cfg.read_text())
     (tmp_path / "telegram.env").write_text("")
     assert cli.main(["--config", str(cfg), "serve", "--check"]) == 1
     err = capsys.readouterr().err

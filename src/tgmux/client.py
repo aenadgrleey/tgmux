@@ -29,12 +29,12 @@ from tgmux.protocol import Frame
 log = logging.getLogger(__name__)
 
 def resolve_socket(instance: str | None = None, socket_path: str | Path | None = None) -> Path:
-    """socket_path > explicit instance > TGMUX_SOCKET > TGMUX_INSTANCE (default "default")."""
+    """Exactly one of them, always explicit: no environment variables decide which gateway."""
+    if (instance is None) == (socket_path is None):
+        raise TypeError('SharedClient needs exactly one of instance="..." (e.g. "default") or socket_path=...')
     if socket_path is not None:
         return Path(socket_path)
-    if instance is None and os.environ.get("TGMUX_SOCKET"):
-        return Path(os.environ["TGMUX_SOCKET"])
-    return config_mod.default_socket(instance)
+    return config_mod.default_socket(config_mod.instance_name(instance))
 
 UpdatesHandler = Callable[[types.Updates], Awaitable[None]]
 
@@ -362,8 +362,8 @@ class GatewaySender:
 class SharedClient(TelegramClient):
     """Drop-in TelegramClient backed by the tgmux gateway.
 
-    >>> client = SharedClient("barabot")                     # instance from TGMUX_INSTANCE, else "default"
-    >>> other = SharedClient("barabot", instance="second")   # another account's gateway
+    >>> client = SharedClient("barabot", instance="default")  # the gateway of instance "default"
+    >>> other = SharedClient("barabot", instance="second")    # another account's gateway
     >>> await client.start()
     """
 

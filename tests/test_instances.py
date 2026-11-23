@@ -44,12 +44,16 @@ def test_instance_name_from_env_and_validation(roots, monkeypatch):
 
 
 def test_client_socket_resolution(roots, monkeypatch):
-    assert resolve_socket() == roots / "st/default/gateway.sock"
+    assert resolve_socket("default") == roots / "st/default/gateway.sock"
     assert resolve_socket("second") == roots / "st/second/gateway.sock"
+    assert resolve_socket(socket_path="/x.sock") == config.Path("/x.sock")
+    # The client never guesses: no instance from the environment, and not both at once.
+    monkeypatch.setenv("TGMUX_INSTANCE", "second")
     monkeypatch.setenv("TGMUX_SOCKET", "/tmp/custom.sock")
-    assert resolve_socket() == config.Path("/tmp/custom.sock")
-    assert resolve_socket("second") == roots / "st/second/gateway.sock"  # explicit instance wins
-    assert resolve_socket("second", "/x.sock") == config.Path("/x.sock")
+    assert resolve_socket("default") == roots / "st/default/gateway.sock"
+    for bad in ((), ("second", "/x.sock")):
+        with pytest.raises(TypeError, match="exactly one"):
+            resolve_socket(*bad)
 
 
 def test_cli_commands_are_per_instance(roots, capsys):
