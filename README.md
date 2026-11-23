@@ -117,8 +117,8 @@ not the shared account), to exactly one configured recipient:
 
 ## Setup
 
-Everything is non-interactive (flags, files, stdin), so it works from scripts,
-CI or systemd provisioning.
+Everything except `tgmux telegram login` is non-interactive (flags, files,
+stdin), so it works from scripts, CI or systemd provisioning.
 
 ```bash
 uv venv && uv pip install -e '.[test]'
@@ -151,6 +151,50 @@ chat_id    = 123456789          # required whenever token_file is set
 Other commands: `tgmux chats [integration]`, `tgmux grant <chat_id> <integration>`,
 `tgmux release <chat_id>`, `tgmux integration list|remove`,
 `tgmux reporter show|test|disable`, `tgmux instances`.
+
+## Deploy: dev on the laptop, prod on the VPS
+
+Two instances of the same Telegram account, each with its **own session**
+(own auth key, logged in separately), like a phone and a desktop:
+
+| | where | instance | how it runs |
+|---|---|---|---|
+| dev | laptop | `dev` | `tgmux --instance dev serve` by hand |
+| prod | VPS | `prod` | systemd `tgmux-prod.service`, code in `/opt/tgmux` |
+
+Never copy a session file between machines: two live copies of one auth key
+make Telegram revoke it. Both gateways see every update of the account, so
+chats the dev Barabot joins show up in prod as "nobody owns this chat"
+reports (once a day per chat).
+
+First install on the VPS (as root):
+
+```bash
+git clone https://github.com/aenadgrleey/tgmux.git /opt/tgmux
+python3 -m venv /opt/tgmux/.venv && /opt/tgmux/.venv/bin/pip install -e /opt/tgmux
+ln -s /opt/tgmux/.venv/bin/tgmux /usr/local/bin/tgmux
+export TGMUX_INSTANCE=prod
+
+tgmux telegram login                 # asks API_ID/API_HASH, phone, code, 2FA
+tgmux integration add barabot
+tgmux reporter set --chat-id 123456789 --token-file /root/.config/tgmux/prod/reporter.token
+tgmux serve --check                  # offline: config, session, credentials, registry
+
+cp /opt/tgmux/deploy/tgmux-prod.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now tgmux-prod
+journalctl -u tgmux-prod -f
+```
+
+Updates: `/opt/tgmux/deploy/prod.sh v0.1.1` fetches, checks out the ref,
+reinstalls, runs `serve --check`, restarts and requires the unit to stay up for
+10 s; otherwise it restores the previous commit and restarts that.
+
+Integrations reach the gateway at `/root/.local/state/tgmux/prod/gateway.sock`
+(`TGMUX_INSTANCE=prod`). In their systemd unit that path must be writable
+(`ProtectHome=read-only` + `ReadWritePaths=/root/.local/state/tgmux/prod`;
+`ProtectHome=true` hides it). `SharedClient` waits for the gateway forever
+with backoff up to 30 s, so integrations survive gateway restarts and may
+start before it; pass `connection_retries=N` to give up instead.
 
 ## Known limits
 

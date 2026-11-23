@@ -103,8 +103,9 @@ class GatewaySender:
         on_updates: UpdatesHandler,
         receive_updates: bool = True,
         auto_reconnect: bool = True,
-        retries: int = 5,
+        retries: int | None = None,
         delay: float = 1,
+        max_delay: float = 30,
         timeout: float = 10,
     ) -> None:
         self.socket_path = str(socket_path)
@@ -113,8 +114,10 @@ class GatewaySender:
         self._on_updates = on_updates
         self._receive_updates = receive_updates
         self._auto_reconnect = auto_reconnect
-        self._retries = retries if retries >= 0 else 10**9
-        self._delay = delay
+        # None or negative: retry forever (the gateway may be restarting or not up yet).
+        self._retries = 10**9 if retries is None or retries < 0 else retries
+        self._delay = max(delay, 0.1)
+        self._max_delay = max(max_delay, self._delay)
         self._timeout = timeout
 
         self._ids = itertools.count(1)
@@ -210,7 +213,22 @@ class GatewaySender:
         loop = asyncio.get_running_loop()
         self._lock.acquire()  # before touching the gateway: fail fast on a second process
         try:
-            await self._open()
+            attempt = 0
+            while True:
+                try:
+                    await self._open()
+                    break
+                except GatewayRejectedError:
+                    raise  # unknown integration / version: retrying will not help
+                except (OSError, asyncio.TimeoutError, ProtocolError) as exc:
+                    # Socket missing or refused: the gateway is starting or restarting.
+                    if not self._auto_reconnect or attempt >= self._retries:
+                        raise
+                    delay = self._backoff(attempt)
+                    attempt += 1
+                    log.warning("tgmux gateway at %s is not reachable (%s); retrying in %.0f s",
+                                self.socket_path, exc, delay)
+                    await asyncio.sleep(delay)
         except BaseException:
             self._lock.release()
             raise
@@ -301,9 +319,12 @@ class GatewaySender:
             else:
                 raise ProtocolError(f"unexpected frame {kind.name} from gateway")
 
+    def _backoff(self, attempt: int) -> float:
+        return min(self._delay * 2 ** min(attempt, 16), self._max_delay)
+
     async def _reconnect(self) -> bool:
         for attempt in range(self._retries):
-            await asyncio.sleep(self._delay)
+            await asyncio.sleep(self._backoff(attempt))
             if not self._user_connected:
                 return False
             try:
@@ -314,7 +335,8 @@ class GatewaySender:
                 log.error("tgmux gateway refused the connection (%s); giving up", exc)
                 return False
             except (OSError, asyncio.TimeoutError, ProtocolError) as exc:
-                log.warning("reconnect attempt %d failed: %s", attempt + 1, exc)
+                log.warning("reconnect attempt %d failed: %s; next in %.0f s",
+                            attempt + 1, exc, self._backoff(attempt + 1))
         return False
 
     async def _dispatch_loop(self) -> None:
@@ -354,6 +376,11 @@ class SharedClient(TelegramClient):
         **kwargs: Any,
     ) -> None:
         kwargs["catch_up"] = False  # the gateway does not replay missed updates
+        # Unlike Telethon's default of 5 attempts, wait for the gateway forever:
+        # it restarts on deploys and on Telegram disconnects. Pass
+        # connection_retries=N to give up after N attempts instead.
+        kwargs.setdefault("connection_retries", -1)
+        kwargs.setdefault("retry_delay", 1)
         super().__init__(MemorySession(), api_id=1, api_hash="0" * 32, **kwargs)
         self._sender = GatewaySender(
             resolve_socket(instance, socket_path),

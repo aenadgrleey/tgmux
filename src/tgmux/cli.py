@@ -103,8 +103,8 @@ async def _serve(cfg: config_mod.Config) -> int:
     upstream_lost.cancel()
 
     server.close()
+    await gateway.close()  # drops integration connections, otherwise wait_closed() hangs
     await server.wait_closed()
-    await gateway.close()
     await upstream.stop()
     account_lock.close()
     session_lock.close()
@@ -114,8 +114,65 @@ async def _serve(cfg: config_mod.Config) -> int:
     return exit_code
 
 
+def _session_has_auth_key(path: Path) -> bool:
+    """Offline: an authorized Telethon session stores a non-empty auth key."""
+    import sqlite3
+
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            row = db.execute("SELECT auth_key FROM sessions LIMIT 1").fetchone()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return False
+    return bool(row and row[0])
+
+
+def check(cfg: config_mod.Config) -> list[str]:
+    """Everything `serve` needs, without connecting to Telegram.
+
+    Safe to run while the gateway is up (deploy scripts do): a second live
+    connection with the same auth key is exactly what must never happen.
+    """
+    problems = []
+    if cfg.session is None:
+        problems.append("[telegram].session is not set; run `tgmux telegram login`")
+    elif not cfg.session.exists():
+        problems.append(f"session file not found: {cfg.session}")
+    elif not _session_has_auth_key(cfg.session):
+        problems.append(f"session has no auth key (not logged in): {cfg.session}")
+    try:
+        config_mod.api_credentials(cfg)
+    except (config_mod.ConfigError, OSError, ValueError) as exc:
+        problems.append(f"API credentials: {exc}")
+    if cfg.reporter is not None:
+        try:
+            cfg.reporter.token()
+        except (config_mod.ConfigError, OSError) as exc:
+            problems.append(f"reporter: {exc}")
+    try:
+        registry = _registry(cfg)
+        if not registry.integrations():
+            problems.append("no integrations registered; run `tgmux integration add NAME`")
+    except Exception as exc:  # unreadable or corrupt DB
+        problems.append(f"registry {cfg.db}: {exc}")
+    for directory in {cfg.state_dir, cfg.socket.parent}:
+        if directory.exists() and not os.access(directory, os.W_OK):
+            problems.append(f"not writable: {directory}")
+    return problems
+
+
 def cmd_serve(args) -> int:
     cfg = _load(args)
+    if args.check:
+        problems = check(cfg)
+        for problem in problems:
+            print(f"error: {problem}", file=sys.stderr)
+        if problems:
+            return 1
+        print(f"instance {cfg.instance}: ok ({cfg.path})")
+        return 0
     logging.basicConfig(level=logging.INFO, format=f"%(asctime)s %(levelname)s [{cfg.instance}] %(name)s: %(message)s")
     logging.getLogger("telethon").setLevel(logging.WARNING)
     try:
@@ -231,6 +288,62 @@ def cmd_telegram_set(args) -> int:
     return 0
 
 
+def cmd_telegram_login(args) -> int:
+    """Interactive: phone, code from Telegram, 2FA password. Run it over ssh on the gateway host."""
+    import getpass
+
+    cfg = _load(args)
+    if not sys.stdin.isatty():
+        raise SystemExit("`tgmux telegram login` is interactive; run it in a terminal "
+                         "(or use `tgmux telegram set` with an existing session)")
+    try:
+        instance_lock = hold_lock(cfg.lock_file, _label(cfg))
+    except LockBusy as busy:
+        raise SystemExit(f"instance {cfg.instance} is running ({busy.holder}); stop it before logging in")
+
+    path = config_mod.config_path(args.config, args.instance)
+    credentials = args.credentials.expanduser().resolve() if args.credentials else cfg.credentials
+    if credentials is None:
+        credentials = path.parent / "telegram.env"
+        print(f"API credentials from https://my.telegram.org (saved to {credentials}, mode 0600)")
+        api_id = input("API_ID: ").strip()
+        api_hash = getpass.getpass("API_HASH (hidden): ").strip()
+        if not api_id.isdigit() or not api_hash:
+            raise SystemExit("API_ID must be a number and API_HASH must not be empty")
+        config_mod.write_private(credentials, f"API_ID={api_id}\nAPI_HASH={api_hash}\n")
+    elif not credentials.exists():
+        raise SystemExit(f"not found: {credentials}")
+    session = (args.session.expanduser().resolve() if args.session
+               else cfg.session or cfg.state_dir / "telegram.session")
+    session.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    # Validate credentials and write [telegram] before talking to Telegram.
+    config_mod.update(path, "telegram", {"session": str(session), "credentials": str(credentials)}, args.instance)
+    api_id, api_hash = config_mod.api_credentials(_load(args))
+
+    async def login() -> str:
+        from telethon import TelegramClient
+
+        client = TelegramClient(str(session), api_id, api_hash)
+        try:
+            # Telethon prompts for the phone, the code and (if set) the 2FA password.
+            await client.start()
+            me = await client.get_me()
+            return f"{me.first_name or ''} (id {me.id})".strip()
+        finally:
+            await client.disconnect()
+
+    try:
+        who = asyncio.run(login())
+    finally:
+        instance_lock.close()
+    if session.exists():
+        os.chmod(session, 0o600)
+    print(f"logged in as {who}; session {session}; [telegram] written to {path}")
+    print(f"next: tgmux --instance {cfg.instance} serve --check")
+    return 0
+
+
 def _read_token(args) -> tuple[str, Path | None]:
     """Return (token, file to save it to or None if it already lives in a file)."""
     if args.token_file is not None:
@@ -306,7 +419,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", help="path to config.toml (default: ~/.config/tgmux/<instance>/config.toml)")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("serve", help="run the gateway").set_defaults(func=cmd_serve)
+    serve = sub.add_parser("serve", help="run the gateway")
+    serve.add_argument("--check", action="store_true",
+                       help="validate config, session and credentials offline, then exit (safe while running)")
+    serve.set_defaults(func=cmd_serve)
     sub.add_parser("instances", help="list configured instances").set_defaults(func=cmd_instances)
 
     integration = sub.add_parser("integration", help="manage integrations").add_subparsers(dest="action", required=True)
@@ -357,6 +473,12 @@ def build_parser() -> argparse.ArgumentParser:
     tset.add_argument("--session", type=Path, required=True, help="authorized .session file")
     tset.add_argument("--credentials", type=Path, required=True, help="env file with API_ID and API_HASH")
     tset.set_defaults(func=cmd_telegram_set)
+    tlogin = telegram.add_parser("login", help="log in interactively (phone, code, 2FA) and save the session")
+    tlogin.add_argument("--credentials", type=Path,
+                        help="env file with API_ID and API_HASH (default: from config, else asked and saved)")
+    tlogin.add_argument("--session", type=Path,
+                        help="where to store the session (default: <state>/<instance>/telegram.session)")
+    tlogin.set_defaults(func=cmd_telegram_login)
     return parser
 
 

@@ -151,6 +151,10 @@ class Gateway:
         return server
 
     async def close(self) -> None:
+        # Close integration connections too: server.wait_closed() waits for them,
+        # and SharedClient never hangs up on its own (it reconnects after we restart).
+        for conn in list(self._connections.values()):
+            await conn.close()
         if self._sweeper is not None:
             self._sweeper.cancel()
             try:
