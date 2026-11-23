@@ -132,9 +132,43 @@ def update_chat(update: TLObject, *, calls: CallMap) -> int | None:
     call = getattr(update, "call", None)
     if isinstance(call, (types.InputGroupCall, types.GroupCall, types.GroupCallDiscarded)):
         return calls.get(call.id)
-    if isinstance(update, types.UpdateUserTyping):
+    if isinstance(update, (types.UpdateUserTyping, types.UpdateShortMessage)):
         return update.user_id
+    if isinstance(update, types.UpdatePeerBlocked):
+        return utils.get_peer_id(update.peer_id)
     return None
+
+
+def message_chats(obj: Any) -> list[tuple[int, int]]:
+    """(msg_id, chat) for every message outside channels that an update or result carries.
+
+    Outside channels a msg_id is unique per account, so it alone names the chat later.
+    """
+    found: list[tuple[int, int]] = []
+
+    def visit(value: Any, depth: int) -> None:
+        if depth > 4:
+            return
+        if isinstance(value, list):
+            for item in value:
+                visit(item, depth + 1)
+        elif isinstance(value, (types.Message, types.MessageService)):
+            if isinstance(value.peer_id, (types.PeerUser, types.PeerChat)):
+                found.append((value.id, utils.get_peer_id(value.peer_id)))
+        elif isinstance(value, types.UpdateShortMessage):
+            found.append((value.id, value.user_id))
+        elif isinstance(value, types.UpdateShortChatMessage):
+            found.append((value.id, chat_id(value.chat_id)))
+        elif isinstance(value, types.UpdateShort):
+            visit(value.update, depth + 1)
+        elif isinstance(value, TLObject):
+            for name in ("message", "messages", "updates", "new_messages"):
+                child = getattr(value, name, None)
+                if isinstance(child, (list, TLObject)):
+                    visit(child, depth + 1)
+
+    visit(obj, 0)
+    return found
 
 
 def referenced_ids(obj: Any) -> set[int]:

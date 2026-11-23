@@ -9,7 +9,7 @@ from tgmux.errors import ChatNotOwnedError, ChatOwnedByOtherError, RequestNotAll
 from tgmux.gateway import Gateway
 from tgmux.peers import channel_id
 
-from fakes import FakeUpstream, RecordingEvents, channel, channel_message, registry_with, updates_for, user
+from fakes import NOW, FakeUpstream, RecordingEvents, channel, channel_message, registry_with, updates_for, user
 
 CHAN = channel_id(5)
 
@@ -357,3 +357,93 @@ def test_stale_requests_expire_with_a_report():
     gw.sweep()
     assert registry.pendings() == []
     assert any(k.startswith("pending-expired:") for k in recorded.keys())
+
+
+# --- deletes outside channels, blocked peers ---------------------------------
+
+BASIC = -20  # marked id of basic group 20
+
+
+def dm_message(user_id, msg_id):
+    return types.Message(id=msg_id, peer_id=types.PeerUser(user_id), date=NOW, message="hi")
+
+
+def group_message(raw_chat, msg_id):
+    return types.Message(id=msg_id, peer_id=types.PeerChat(raw_chat), date=NOW, message="hi")
+
+
+def routed():
+    upstream, registry, recorded, gw = make()
+    delivered = []
+    gw._deliver = lambda owner, update, entities, chat: delivered.append((owner, update))
+    registry.claim(10, "barabot", "dm")
+    registry.claim(BASIC, "lofi", "join")
+    return upstream, registry, recorded, gw, delivered
+
+
+def test_delete_is_split_between_owners_by_seen_message_ids():
+    upstream, registry, recorded, gw, delivered = routed()
+
+    async def scenario():
+        await upstream.push(types.UpdateNewMessage(dm_message(10, 100), 1, 1), [user(10)])
+        await upstream.push(types.UpdateShortChatMessage(101, 30, 20, "hi", 2, 1, NOW), [])
+        await upstream.push(types.UpdateDeleteMessages([100, 101, 999], 3, 3), [])
+    run(scenario())
+
+    deletes = [(owner, u.messages) for owner, u in delivered if isinstance(u, types.UpdateDeleteMessages)]
+    assert sorted(deletes) == [("barabot", [100]), ("lofi", [101])]
+    assert "no-peer:UpdateDeleteMessages" in recorded.keys()
+    assert registry.message_chats([100, 101]) == {}  # a delete is final
+
+
+def test_messages_from_request_results_are_remembered():
+    upstream, registry, _, gw, delivered = routed()
+    upstream.on(functions.messages.GetHistoryRequest, lambda r: types.messages.Messages(
+        messages=[group_message(20, 300)], chats=[], users=[], topics=[]))
+    run(gw.execute("lofi", functions.messages.GetHistoryRequest(
+        types.InputPeerChat(20), offset_id=0, offset_date=None, add_offset=0, limit=10, max_id=0, min_id=0, hash=0)))
+    upstream.on(functions.messages.SendMessageRequest, lambda r: types.UpdateShortSentMessage(
+        id=301, pts=1, pts_count=1, date=NOW))
+    run(gw.execute("barabot", send(types.InputPeerUser(10, 100))))
+
+    run(upstream.push(types.UpdateDeleteMessages([300, 301], 4, 2), []))
+    assert sorted((o, u.messages) for o, u in delivered) == [("barabot", [301]), ("lofi", [300])]
+
+
+def test_delete_in_unowned_chat_is_dropped_silently():
+    upstream, registry, recorded, gw, delivered = routed()
+
+    async def scenario():
+        await upstream.push(types.UpdateNewMessage(group_message(55, 400), 1, 1), [])
+        await upstream.push(types.UpdateDeleteMessages([400], 2, 1), [])
+    run(scenario())
+    assert delivered == []
+    assert "no-peer:UpdateDeleteMessages" not in recorded.keys()
+
+
+def test_old_message_ids_expire():
+    upstream = FakeUpstream()
+    registry = registry_with("barabot")
+    wall = Clock()
+    gw = Gateway(upstream, registry, RecordingEvents(), wall_clock=wall, message_chat_ttl=100)
+    run(upstream.push(types.UpdateNewMessage(dm_message(10, 500), 1, 1), []))
+    wall.now = 50
+    gw.sweep()
+    assert registry.message_chats([500]) == {500: 10}
+    wall.now = 101
+    gw.sweep()
+    assert registry.message_chats([500]) == {}
+
+
+def test_peer_blocked_goes_to_private_chat_owner():
+    upstream, _, recorded, gw, delivered = routed()
+    run(upstream.push(types.UpdatePeerBlocked(types.PeerUser(10), blocked=True), [user(10)]))
+    assert [(o, type(u).__name__) for o, u in delivered] == [("barabot", "UpdatePeerBlocked")]
+    assert recorded.keys() == []
+
+
+def test_short_private_message_goes_to_private_chat_owner():
+    upstream, _, recorded, gw, delivered = routed()
+    run(upstream.push(types.UpdateShortMessage(id=600, user_id=10, message="hi", pts=1, pts_count=1, date=NOW), []))
+    assert [(o, type(u).__name__) for o, u in delivered] == [("barabot", "UpdateShortMessage")]
+    assert recorded.keys() == []

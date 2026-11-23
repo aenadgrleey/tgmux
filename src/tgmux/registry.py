@@ -40,6 +40,16 @@ CREATE TABLE IF NOT EXISTS pending_joins (
     title       TEXT NOT NULL,
     created_at  INTEGER NOT NULL
 );
+
+-- Which chat a message outside channels lives in. Private chats and basic groups
+-- share one msg_id sequence per account, and UpdateDeleteMessages carries only
+-- ids, so this is how deletes find their owner. Rows expire after a while.
+CREATE TABLE IF NOT EXISTS message_chats (
+    msg_id      INTEGER PRIMARY KEY,
+    chat_id     INTEGER NOT NULL,
+    seen_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS message_chats_by_seen ON message_chats(seen_at);
 """
 
 
@@ -212,6 +222,34 @@ class Registry:
             f"DELETE FROM pending_joins WHERE created_at < ? RETURNING {_PENDING_COLUMNS}", (older_than,)
         ).fetchall()
         return [PendingJoin(*row) for row in rows]
+
+    # --- message -> chat (outside channels) ---------------------------------
+
+    def remember_messages(self, pairs: list[tuple[int, int]], now: int | None = None) -> None:
+        if not pairs:
+            return
+        seen = int(time.time()) if now is None else now
+        self._db.executemany(
+            "INSERT INTO message_chats(msg_id, chat_id, seen_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(msg_id) DO UPDATE SET chat_id = excluded.chat_id, seen_at = excluded.seen_at",
+            [(msg_id, chat, seen) for msg_id, chat in pairs],
+        )
+
+    def message_chats(self, msg_ids: list[int]) -> dict[int, int]:
+        found: dict[int, int] = {}
+        for i in range(0, len(msg_ids), 500):
+            part = msg_ids[i:i + 500]
+            rows = self._db.execute(
+                f"SELECT msg_id, chat_id FROM message_chats WHERE msg_id IN ({','.join('?' * len(part))})", part
+            )
+            found.update(rows)
+        return found
+
+    def forget_messages(self, msg_ids: list[int]) -> None:
+        self._db.executemany("DELETE FROM message_chats WHERE msg_id = ?", [(i,) for i in msg_ids])
+
+    def expire_messages(self, older_than: int) -> int:
+        return self._db.execute("DELETE FROM message_chats WHERE seen_at < ?", (older_than,)).rowcount
 
     def bindings(self) -> list[Binding]:
         return [

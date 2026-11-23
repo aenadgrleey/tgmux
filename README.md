@@ -88,6 +88,13 @@ the ones the update mentions. Group calls are mapped to chats from
 `GetFullChannel`/`GetFullChat` results and `UpdateGroupCall`, so pytgcalls can
 run inside an integration on top of `SharedClient`.
 
+Deletes in private chats and basic groups (`UpdateDeleteMessages`) carry only
+message ids. Outside channels a message id is unique per account, so the
+gateway keeps `msg_id -> chat` in `tgmux.db` for 30 days, filled from incoming
+messages and request results, and gives each owner only its own ids. Deletes
+of messages it never saw are dropped with a warning. `UpdatePeerBlocked` and
+`UpdateShortMessage` go to the owner of the private chat with that user.
+
 ## Join requests
 
 Chats that need an admin's approval go through one mechanism, whether the

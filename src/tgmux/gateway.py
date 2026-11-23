@@ -29,7 +29,7 @@ from tgmux.errors import (
     ProtocolError,
     RequestNotAllowedError,
 )
-from tgmux.peers import CallMap, channel_id, chat_id, referenced_ids, request_scope, update_chat
+from tgmux.peers import CallMap, channel_id, chat_id, message_chats, referenced_ids, request_scope, update_chat
 from tgmux.policy import DM_CLAIMING, GLOBAL_ALLOW, unwrap
 from tgmux.protocol import Frame
 from tgmux.registry import Registry
@@ -47,6 +47,7 @@ OFFLINE_GRACE = 30                # an integration absent this long is reported 
 STILL_OFFLINE_REMINDER = 3600     # repeat the "still unavailable" report this often
 SWEEP_INTERVAL = 10
 PENDING_TTL = 30 * 86400          # join requests not approved within this are forgotten
+MESSAGE_CHAT_TTL = 30 * 86400     # deletes of messages older than this cannot find their chat
 
 
 @dataclass
@@ -109,6 +110,7 @@ class Gateway:
         backlog_ttl: float = BACKLOG_TTL,
         offline_grace: float = OFFLINE_GRACE,
         pending_ttl: float = PENDING_TTL,
+        message_chat_ttl: float = MESSAGE_CHAT_TTL,
         clock=time.monotonic,
         wall_clock=time.time,
         auto_register: bool = True,
@@ -129,6 +131,7 @@ class Gateway:
         self._clock = clock
         self._offline_grace = offline_grace
         self._pending_ttl = pending_ttl
+        self._message_chat_ttl = message_chat_ttl
         self._wall_clock = wall_clock
         self._outages: dict[str, _Outage] = {}
         self._sweeper: asyncio.Task | None = None
@@ -299,7 +302,16 @@ class Gateway:
             self._last_call_join = (integration, time.monotonic())
         result = await self.upstream.invoke(inner, dc_id)
         self.calls.learn(result)
+        self._remember_messages(inner, result, scope.chats)
         return result
+
+    def _remember_messages(self, request: TLObject, result: Any, chats: set[int]) -> None:
+        pairs = message_chats(result)
+        if isinstance(result, types.UpdateShortSentMessage) and len(chats) == 1:
+            (chat,) = chats
+            if not isinstance(utils.resolve_id(chat)[1], types.PeerChannel):
+                pairs.append((result.id, chat))
+        self.registry.remember_messages(pairs, int(self._wall_clock()))
 
     def _is_self(self, user: TLObject) -> bool:
         return isinstance(user, types.InputUserSelf) or (
@@ -482,7 +494,12 @@ class Gateway:
 
     def _route(self, update: TLObject, entities: dict[int, TLObject]) -> None:
         self.calls.learn(update)
+        self.registry.remember_messages(message_chats(update), int(self._wall_clock()))
         update_name = type(update).__name__
+
+        if isinstance(update, types.UpdateDeleteMessages):
+            self._route_deletes(update)
+            return
 
         if isinstance(update, types.UpdateGroupCallConnection):
             last = self._last_call_join
@@ -509,6 +526,25 @@ class Gateway:
                 )
             return
         self._deliver(owner, update, entities, chat)
+
+    def _route_deletes(self, update: types.UpdateDeleteMessages) -> None:
+        """Split a chat-less delete by the chats its ids were seen in; each owner gets only its ids."""
+        known = self.registry.message_chats(update.messages)
+        by_owner: dict[str, list[int]] = defaultdict(list)
+        for msg_id in update.messages:
+            chat = known.get(msg_id)
+            owner = self.registry.owner(chat) if chat is not None else None
+            if owner is not None:
+                by_owner[owner].append(msg_id)
+        missing = len(update.messages) - len(known)
+        if missing:
+            self.events.report(
+                "no-peer:UpdateDeleteMessages",
+                f"Удаление {missing} сообщ. без известного чата отброшено (старше {_duration(self._message_chat_ttl)} или не виденных)",
+            )
+        for owner, ids in by_owner.items():
+            self._deliver(owner, types.UpdateDeleteMessages(ids, update.pts, update.pts_count), {}, None)
+        self.registry.forget_messages(list(known))
 
     def _deliver(self, owner: str, update: TLObject, entities: dict[int, TLObject], chat: int | None) -> None:
         conn = self._connections.get(owner)
@@ -588,6 +624,7 @@ class Gateway:
                         f"(уже {expired}). Итог потерь придёт при переподключении.",
                         window=0,
                     )
+        self.registry.expire_messages(int(self._wall_clock() - self._message_chat_ttl))
         for pending in self.registry.expire_pending(int(self._wall_clock() - self._pending_ttl)):
             self.events.report(
                 f"pending-expired:{pending.id}",
