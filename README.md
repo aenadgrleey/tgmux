@@ -74,6 +74,7 @@ are prefixed `tgmux[<instance>]`.
 |---|---|
 | `channels.JoinChannel` / `messages.ImportChatInvite` into a free chat | the chat becomes its own |
 | the same into a chat owned by someone else | `ChatOwnedByOtherError`, nothing is sent to Telegram |
+| `channels.CreateChannel` / `messages.CreateChat` | the new chat becomes its own |
 | first `SendMessage`/`SendMedia`/`SendMultiMedia`/`ForwardMessages` into a free private chat | the private chat becomes its own |
 | `channels.LeaveChannel` / leaving a basic group | leaves and frees the chat |
 | any request touching a chat it does not own | `ChatNotOwnedError` |

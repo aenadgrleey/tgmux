@@ -48,6 +48,23 @@ def test_join_claims_free_chat():
     run(gw.execute("barabot", send(types.InputPeerChannel(5, 50))))
 
 
+def test_create_channel_claims_the_new_chat():
+    upstream, registry, _, gw = make()
+    upstream.on(functions.channels.CreateChannelRequest, lambda r: updates_for([channel(5)]))
+    run(gw.execute("lofi", functions.channels.CreateChannelRequest("radio", "", megagroup=True)))
+    assert registry.owner(CHAN) == "lofi"
+    run(gw.execute("lofi", send(types.InputPeerChannel(5, 50))))
+
+
+def test_create_basic_group_claims_from_invited_users():
+    upstream, registry, _, gw = make()
+    group = types.Chat(id=7, title="radio", photo=types.ChatPhotoEmpty(), participants_count=1, date=None, version=1)
+    upstream.on(functions.messages.CreateChatRequest,
+                lambda r: types.messages.InvitedUsers(updates=updates_for([group]), missing_invitees=[]))
+    run(gw.execute("lofi", functions.messages.CreateChatRequest(users=[], title="radio")))
+    assert registry.owner(-7) == "lofi"
+
+
 def test_join_of_taken_chat_is_refused_before_telegram():
     upstream, registry, _, gw = make()
     registry.claim(CHAN, "lofi", "join")

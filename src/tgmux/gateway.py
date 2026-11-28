@@ -289,6 +289,8 @@ class Gateway:
             return await self._leave(integration, chat_id(inner.chat_id), inner)
         if isinstance(inner, functions.messages.GetDialogsRequest):
             return await self._dialogs(integration, inner)
+        if isinstance(inner, (functions.channels.CreateChannelRequest, functions.messages.CreateChatRequest)):
+            return await self._create_chat(integration, inner)
 
         scope = request_scope(inner, self_id=self.upstream.self_id, calls=self.calls)
         if scope.unresolved_calls:
@@ -356,6 +358,19 @@ class Gateway:
                 raise
             self._claim(integration, chat, "join", request)
             return result
+
+    async def _create_chat(self, integration: str, request) -> Any:
+        result = await self.upstream.invoke(request)
+        updates = result.updates if isinstance(result, types.messages.InvitedUsers) else result
+        created = [c for c in getattr(updates, "chats", []) if isinstance(c, (types.Channel, types.Chat))]
+        if not created:
+            self.events.report(
+                f"create-no-chat:{integration}",
+                f"{integration}: {type(request).__name__} прошёл, но в ответе нет чата ({type(result).__name__}); владелец не назначен",
+            )
+        for chat in created:
+            self._claim(integration, utils.get_peer_id(chat), "create", request)
+        return result
 
     async def _import_invite(self, integration: str, request) -> Any:
         check = await self.upstream.invoke(functions.messages.CheckChatInviteRequest(request.hash))
